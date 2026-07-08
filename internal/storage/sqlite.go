@@ -139,13 +139,16 @@ FROM jobs WHERE id = ?;`, id)
 	return scanJob(row)
 }
 
-// ListJobs returns every job in the given state, oldest first.
+// ListJobs returns every job in the given state, oldest first. The rowid
+// tiebreaker (see ClaimNextJob's doc comment) keeps same-second jobs in
+// actual insertion order rather than id order, since job ids are random hex
+// when auto-generated and so aren't chronological themselves.
 func (s *Store) ListJobs(ctx context.Context, state job.State) ([]job.Job, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, locked_pgid, created_at, updated_at
 FROM jobs
 WHERE state = ?
-ORDER BY created_at ASC, id ASC;`, string(state))
+ORDER BY created_at ASC, rowid ASC;`, string(state))
 	if err != nil {
 		return nil, fmt.Errorf("list jobs: %w", err)
 	}
@@ -203,6 +206,41 @@ func (s *Store) GetConfigInt(ctx context.Context, key string) (int, error) {
 	return value, nil
 }
 
+// ConfigEntry is one row of the config table, as surfaced by ListConfig for
+// "queuectl config list".
+type ConfigEntry struct {
+	Key   string
+	Value int
+}
+
+// ListConfig returns every config key and its current value, ordered by key
+// for stable output. All rows are seeded with defaults by migrate, so this
+// always reflects the full set of known keys.
+func (s *Store) ListConfig(ctx context.Context) ([]ConfigEntry, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT key, value FROM config ORDER BY key ASC;`)
+	if err != nil {
+		return nil, fmt.Errorf("list config: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []ConfigEntry
+	for rows.Next() {
+		var key, raw string
+		if err := rows.Scan(&key, &raw); err != nil {
+			return nil, fmt.Errorf("scan config row: %w", err)
+		}
+		value, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("config %s is not an integer: %w", key, err)
+		}
+		entries = append(entries, ConfigEntry{Key: key, Value: value})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate config: %w", err)
+	}
+	return entries, nil
+}
+
 // SetConfigInt updates a config value. It returns an error if key does not
 // already exist in the config table, so callers must validate the key
 // (see appconfig.ValidateConfigValue) before calling this.
@@ -236,6 +274,29 @@ WHERE last_heartbeat > datetime('now', '-' || ? || ' seconds');`, staleSeconds).
 		return 0, fmt.Errorf("count active workers: %w", err)
 	}
 	return count, nil
+}
+
+// DeleteStaleWorkers removes worker rows whose last_heartbeat is older than
+// olderThanSeconds, returning the number of rows removed. A worker row is
+// normally deleted by its own graceful shutdown (DeleteWorker); this exists
+// to garbage-collect rows left behind by a worker that was SIGKILLed rather
+// than stopped gracefully, which would otherwise accumulate in the workers
+// table forever. Callers must pass a generous threshold - well beyond
+// worker-stale-seconds, which only governs status's "active" display and is
+// deliberately allowed to be tight - since this is a destructive cleanup,
+// not a display filter.
+func (s *Store) DeleteStaleWorkers(ctx context.Context, olderThanSeconds int) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `
+DELETE FROM workers
+WHERE last_heartbeat < datetime('now', '-' || ? || ' seconds');`, olderThanSeconds)
+	if err != nil {
+		return 0, fmt.Errorf("delete stale workers: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("delete stale workers rows affected: %w", err)
+	}
+	return rows, nil
 }
 
 // RegisterWorker upserts a worker row with a fresh heartbeat timestamp.

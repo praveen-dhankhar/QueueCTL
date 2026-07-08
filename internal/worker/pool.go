@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -15,7 +16,6 @@ import (
 )
 
 const (
-	heartbeatInterval = 5 * time.Second
 	// claimErrorSleep is how long a worker backs off after a failed claim
 	// or config read, so a transient DB error doesn't spin the poll loop.
 	// It intentionally does not use poll-interval-ms: that config controls
@@ -23,6 +23,11 @@ const (
 	// fallback for when reading that same config value has itself failed.
 	claimErrorSleep = 500 * time.Millisecond
 )
+
+// executeCommandFn is ExecuteCommand, indirected through a package-level var
+// so tests can inject a panic to exercise executeJob's panic-recovery path
+// without actually needing a buggy command or store call to trigger one.
+var executeCommandFn = ExecuteCommand
 
 // Pool runs count worker goroutines against store, each independently
 // claiming and executing jobs, alongside heartbeat, lease-renewal, and
@@ -136,19 +141,37 @@ func (p *Pool) runWorker(ctx context.Context, workerID string) {
 	}
 }
 
+// executeJob runs claimed.Command and records its outcome. It recovers from
+// any panic raised while doing so (in ExecuteCommand or in the store calls
+// below) so that a single bad job can't take down the whole worker pool: the
+// panic is logged and the job is simply abandoned mid-claim, left for the
+// reaper to reclaim once its lock goes stale, the same recovery path used
+// for a worker that crashes outright. The lease-renewal goroutine is always
+// stopped via a deferred call (in addition to the explicit stop on the
+// normal path below, which needs the final lockedAt value before that
+// point) so a panic can't leak it renewing a lock forever and starving the
+// reaper of a stale row to recover.
 func (p *Pool) executeJob(workerID string, claimed job.Job) {
 	p.logger.Info("executing job", "worker_id", workerID, "job_id", claimed.ID)
 	lease := newJobLease(claimed.LockedAt)
 	leaseCtx, stopLease := context.WithCancel(context.Background())
 	leaseDone := make(chan struct{})
 	go p.renewJobLease(leaseCtx, workerID, claimed.ID, lease, leaseDone)
+	defer stopLease()
+
+	defer func() {
+		if r := recover(); r != nil {
+			p.logger.Error("panic while executing job; abandoning claim for the reaper to recover",
+				"worker_id", workerID, "job_id", claimed.ID, "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
 
 	onStart := func(pid int) {
 		if err := p.store.SetJobLockPGID(context.Background(), claimed.ID, workerID, pid); err != nil {
 			p.logRecordError("record job process group failed", workerID, claimed.ID, err)
 		}
 	}
-	result := ExecuteCommand(context.Background(), claimed.Command, onStart)
+	result := executeCommandFn(context.Background(), claimed.Command, onStart)
 	stopLease()
 	<-leaseDone
 	if lockedAt := lease.currentLockedAt(); lockedAt != nil {
@@ -271,7 +294,7 @@ func (l *jobLease) currentLockedAt() *time.Time {
 }
 
 func (p *Pool) heartbeatLoop(ctx context.Context, workerID string) {
-	ticker := time.NewTicker(heartbeatInterval)
+	ticker := time.NewTicker(appconfig.HeartbeatInterval)
 	defer ticker.Stop()
 
 	for {

@@ -12,6 +12,17 @@ import (
 // ClaimNextJob atomically claims the oldest eligible job (pending, or failed
 // with an elapsed backoff) for workerID and marks it processing.
 //
+// Ordering is "ORDER BY created_at ASC, rowid ASC": created_at is stored
+// with one-second resolution (see sqliteTimeLayout), so two jobs enqueued
+// within the same wall-clock second would otherwise tie and fall back to
+// whatever order SQLite happens to return them in. rowid is SQLite's
+// implicit, monotonically increasing insertion-order column (present on any
+// table, like jobs, that isn't declared WITHOUT ROWID) - ordering by it as a
+// tiebreaker makes same-second claims deterministic and actually
+// chronological, which job id itself is not: enqueue generates a random hex
+// id when none is given, so sorting by id would be arbitrary rather than
+// insertion-ordered.
+//
 // It uses a raw "BEGIN IMMEDIATE" transaction instead of db.BeginTx because
 // Go's database/sql package has no way to request SQLite's IMMEDIATE
 // transaction mode: BeginTx's sql.TxOptions only configures isolation level
@@ -37,7 +48,7 @@ SELECT id
 FROM jobs
 WHERE state IN ('pending', 'failed')
 AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
-ORDER BY created_at ASC
+ORDER BY created_at ASC, rowid ASC
 LIMIT 1
 )
 RETURNING id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, locked_pgid, created_at, updated_at;`, workerID)

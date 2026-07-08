@@ -91,6 +91,60 @@ func TestClaimRules(t *testing.T) {
 	require.Equal(t, "failed-past", claimed.ID)
 }
 
+// TestClaimOrdersBySameSecondInsertionOrderNotID guards against a real
+// ordering gap: created_at has one-second resolution (sqliteTimeLayout has
+// no fractional seconds), so jobs enqueued within the same second tie on
+// the primary sort key. Before the rowid tiebreaker, that tie broke on
+// whatever order SQLite happened to return matching rows in - not
+// necessarily insertion order. IDs here are deliberately reverse-alphabetical
+// versus insertion order, so a test that passed only because it happened to
+// also sort correctly by id would fail here.
+func TestClaimOrdersBySameSecondInsertionOrderNotID(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	now := time.Now().UTC()
+	ids := []string{"zzz-first", "mmm-second", "aaa-third"}
+	for _, id := range ids {
+		j, err := job.New(id, "echo "+id, 3, now)
+		require.NoError(t, err)
+		require.NoError(t, store.InsertJob(ctx, j))
+	}
+
+	for _, want := range ids {
+		claimed, ok, err := store.ClaimNextJob(ctx, "worker1")
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, want, claimed.ID, "claim order should follow insertion order, not id or a coincidental row order")
+	}
+}
+
+// TestListJobsOrdersBySameSecondInsertionOrderNotID is ListJobs' counterpart
+// to TestClaimOrdersBySameSecondInsertionOrderNotID: "queuectl list" should
+// show same-second jobs in the order they were enqueued, not alphabetically
+// by (possibly random, auto-generated) id.
+func TestListJobsOrdersBySameSecondInsertionOrderNotID(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	now := time.Now().UTC()
+	ids := []string{"zzz-first", "mmm-second", "aaa-third"}
+	for _, id := range ids {
+		j, err := job.New(id, "echo "+id, 3, now)
+		require.NoError(t, err)
+		require.NoError(t, store.InsertJob(ctx, j))
+	}
+
+	jobs, err := store.ListJobs(ctx, job.StatePending)
+	require.NoError(t, err)
+	require.Len(t, jobs, 3)
+	for i, want := range ids {
+		require.Equal(t, want, jobs[i].ID, "list order should follow insertion order, not id")
+	}
+}
+
 func TestInsertJobDuplicateIDFails(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
@@ -373,6 +427,65 @@ func TestListJobRuns(t *testing.T) {
 	noRuns, err := store.ListJobRuns(ctx, "no-such-job")
 	require.NoError(t, err)
 	require.Empty(t, noRuns)
+}
+
+// TestDeleteStaleWorkers guards the worker-row garbage collection fix: a
+// worker that exits gracefully deletes its own row (DeleteWorker), but one
+// that is SIGKILLed leaves its row behind forever unless something purges
+// it. last_heartbeat can't be backdated through the public API (RegisterWorker
+// always stamps "now"), so this reaches around it with a raw connection to
+// the same database file - the same technique
+// TestOpenAddsLockedPGIDColumnToPreExistingDatabase uses below.
+func TestDeleteStaleWorkers(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	store, err := storage.Open(ctx, dbPath)
+	require.NoError(t, err)
+	defer store.Close()
+
+	require.NoError(t, store.RegisterWorker(ctx, "fresh-worker", 111, "host"))
+	require.NoError(t, store.RegisterWorker(ctx, "abandoned-worker", 222, "host"))
+
+	raw, err := sql.Open("sqlite", dbPath)
+	require.NoError(t, err)
+	_, err = raw.Exec(`UPDATE workers SET last_heartbeat = datetime('now', '-2 hours') WHERE worker_id = 'abandoned-worker';`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+
+	purged, err := store.DeleteStaleWorkers(ctx, 3600)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, purged)
+
+	remaining, err := store.CountActiveWorkers(ctx, 999999)
+	require.NoError(t, err)
+	require.Equal(t, 1, remaining, "only the fresh worker's row should remain")
+}
+
+// TestReaperPurgesAbandonedWorkerRows is the reaper-integration counterpart
+// to TestDeleteStaleWorkers: RunReaperOnce must actually invoke the purge as
+// part of its normal pass, not just leave DeleteStaleWorkers as dead code.
+func TestReaperPurgesAbandonedWorkerRows(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	store, err := storage.Open(ctx, dbPath)
+	require.NoError(t, err)
+	defer store.Close()
+
+	require.NoError(t, store.RegisterWorker(ctx, "fresh-worker", 111, "host"))
+	require.NoError(t, store.RegisterWorker(ctx, "abandoned-worker", 222, "host"))
+
+	raw, err := sql.Open("sqlite", dbPath)
+	require.NoError(t, err)
+	_, err = raw.Exec(`UPDATE workers SET last_heartbeat = datetime('now', '-2 hours') WHERE worker_id = 'abandoned-worker';`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+
+	_, err = worker.RunReaperOnce(ctx, store, nil)
+	require.NoError(t, err)
+
+	remaining, err := store.CountActiveWorkers(ctx, 999999)
+	require.NoError(t, err)
+	require.Equal(t, 1, remaining, "reaper pass should have purged the abandoned worker row")
 }
 
 // TestReaperKillsOrphanedProcessGroupOnRecovery reproduces the scenario the

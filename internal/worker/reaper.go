@@ -12,15 +12,31 @@ import (
 	"queuectl/internal/storage"
 )
 
-const reaperInterval = 30 * time.Second
+const (
+	reaperInterval = 30 * time.Second
+
+	// staleWorkerRowTTL is how old a worker row's last_heartbeat must be
+	// before the reaper garbage-collects it. This is deliberately much
+	// larger than worker-stale-seconds (which only controls whether
+	// `status` displays a worker as active, and can legitimately be
+	// configured tight - see appconfig.HeartbeatInterval): a worker that
+	// exits gracefully already deletes its own row, so any row surviving
+	// this long can only belong to a process that was SIGKILLed, crashed,
+	// or otherwise vanished without cleaning up after itself.
+	staleWorkerRowTTL = 1 * time.Hour
+)
 
 // RunReaperOnce recovers processing jobs whose lock has gone stale
 // (locked_at older than the configured lock-timeout-seconds), moving each
 // either back to failed with a backoff or to dead if retries are
-// exhausted. logger may be nil to suppress per-job warnings. It returns
-// the number of jobs actually recovered, which can be less than the
-// number found stale if a worker's lease renewal or completion raced with
-// the reaper (see RecoverStaleJob's lock fencing).
+// exhausted, and also garbage-collects worker rows abandoned by a
+// non-graceful exit (see staleWorkerRowTTL). logger may be nil to suppress
+// per-job warnings. It returns the number of jobs actually recovered, which
+// can be less than the number found stale if a worker's lease renewal or
+// completion raced with the reaper (see RecoverStaleJob's lock fencing).
+// A failure to purge stale worker rows is logged but does not fail the
+// call or affect the returned count, since job recovery is this function's
+// primary responsibility and worker-row cleanup is best-effort.
 func RunReaperOnce(ctx context.Context, store *storage.Store, logger *slog.Logger) (int, error) {
 	lockTimeout, err := store.GetConfigInt(ctx, appconfig.KeyLockTimeoutSeconds)
 	if err != nil {
@@ -69,6 +85,15 @@ func RunReaperOnce(ctx context.Context, store *storage.Store, logger *slog.Logge
 			}
 		}
 	}
+
+	if purged, err := store.DeleteStaleWorkers(ctx, int(staleWorkerRowTTL/time.Second)); err != nil {
+		if logger != nil {
+			logger.Error("delete stale worker rows failed", "error", err)
+		}
+	} else if purged > 0 && logger != nil {
+		logger.Warn("purged worker rows abandoned without a graceful shutdown", "count", purged)
+	}
+
 	return recovered, nil
 }
 
