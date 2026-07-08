@@ -1,65 +1,66 @@
 # queuectl
 
-`queuectl` is a CLI-based background job queue for trusted shell commands. Jobs are stored in SQLite, processed by worker goroutines, retried with exponential backoff, and moved to a Dead Letter Queue when they exhaust their allowed attempts.
+`queuectl` is a small CLI job queue for running shell commands in the background. Enqueue a job, spin up a few workers, and they'll pick jobs off the queue, run them, retry the ones that fail with exponential backoff, and park anything that keeps failing in a Dead Letter Queue. Everything is backed by SQLite, so the queue survives restarts.
+
+I built this as a backend internship assignment, so the scope is deliberately focused: a single-host queue you run from the terminal, not a distributed job system.
 
 Demo video: <add Google Drive / Loom link here before submission>
 
 ## Setup
 
-Requirements:
+You'll need:
 
 - Go 1.22+
-- macOS or Linux
-- POSIX `sh`
+- macOS or Linux (jobs run through `sh -c`, so Windows isn't supported)
 
-Install dependencies and build:
+Build it:
 
 ```bash
 go mod tidy
 go build -o queuectl ./cmd/queuectl
 ```
 
-The default database is `.queuectl/queuectl.db`. The `.queuectl/` directory is created automatically.
+That's it, no external database to install. By default `queuectl` writes to `.queuectl/queuectl.db` and creates the `.queuectl/` directory itself the first time you run it.
 
-Database path precedence:
+If you want a different database file, `queuectl` checks in this order:
 
-1. `--db ./custom.db`
-2. `QUEUECTL_DB_PATH=./custom.db`
-3. `.queuectl/queuectl.db`
+1. `--db ./custom.db` flag
+2. `QUEUECTL_DB_PATH` environment variable
+3. `.queuectl/queuectl.db` (the default, if neither of the above is set)
 
 ## Usage
 
-Enqueue a job:
+Enqueue a job. If you don't give it an `id`, one gets generated for you:
 
 ```bash
 ./queuectl enqueue '{"id":"job1","command":"echo hello"}'
 ```
 
-Start workers in the foreground:
+Start a few workers. This runs in the foreground and blocks, so you'll want a separate terminal (or run it with `&`, or under something like `tmux`/`nohup`):
 
 ```bash
 ./queuectl worker start --count 3
 ```
 
-Stop the worker supervisor:
+When you're done, stop them gracefully — in-flight jobs get to finish before the process exits:
 
 ```bash
 ./queuectl worker stop
 ```
 
-If process verification can't run (e.g. `ps` is blocked in a sandboxed environment), pass `--force` to skip verification and signal the PID anyway:
+`worker stop` double-checks the PID it's about to signal actually belongs to a `queuectl` process before sending anything. In a sandboxed environment where that check itself can't run (e.g. `ps` is blocked), skip it with `--force`:
 
 ```bash
 ./queuectl worker stop --force
 ```
 
-Show queue status:
+Check on things:
 
 ```bash
 ./queuectl status
 ```
 
-Sample output:
+which prints something like:
 
 ```text
 Jobs:
@@ -73,20 +74,20 @@ Workers:
 active: 3
 ```
 
-List jobs by state:
+Look at jobs in a given state:
 
 ```bash
 ./queuectl list --state pending
 ```
 
-Inspect and retry DLQ jobs:
+Jobs that ran out of retries land in the DLQ — list them, and retry the ones worth retrying:
 
 ```bash
 ./queuectl dlq list
 ./queuectl dlq retry job1
 ```
 
-Update configuration:
+Tune the defaults (see the [Configuration](#configuration) table below for what each key does):
 
 ```bash
 ./queuectl config set max-retries 3
@@ -97,7 +98,7 @@ Update configuration:
 ./queuectl config set stop-timeout-seconds 30
 ```
 
-Use a custom database:
+Running more than one queue side by side? Point each at its own database:
 
 ```bash
 ./queuectl --db ./custom.db enqueue '{"id":"job1","command":"echo hello"}'
@@ -106,54 +107,61 @@ QUEUECTL_DB_PATH=./custom.db ./queuectl status
 
 ## Architecture
 
-The code is split into small internal packages:
+I split the code into a few small packages rather than one flat `main.go`, mostly so the state machine and the SQL don't end up tangled with CLI parsing:
 
-- `internal/cli`: Cobra commands and CLI output.
-- `internal/config`: DB path resolution, default paths, and config validation.
-- `internal/job`: job model, valid states, and state transitions.
-- `internal/storage`: SQLite connection setup, migrations, config storage, atomic claiming, status, DLQ updates, worker rows, and job run records.
-- `internal/worker`: worker pool, command execution, exponential backoff, heartbeat, job lease renewal, supervisor PID handling, and crash recovery reaper.
+- `internal/cli` — the Cobra commands themselves and how they format output.
+- `internal/config` — where the database lives, PID file naming, config validation.
+- `internal/job` — the `Job` struct, its valid states, and the transitions between them.
+- `internal/storage` — everything SQLite: migrations, atomic claiming, DLQ updates, worker heartbeats, job run history.
+- `internal/worker` — the actual worker loop: claiming jobs, running commands, backoff math, lease renewal, the supervisor's PID handling, and the crash-recovery reaper.
 
-SQLite is the source of truth. On open, queuectl applies WAL mode, a busy timeout, normal synchronous mode, and foreign keys. Tables and default config values are created automatically.
+SQLite is the single source of truth for job state — there's no in-memory queue sitting in front of it. On startup `queuectl` turns on WAL mode, sets a busy timeout, uses `synchronous = NORMAL`, and enables foreign keys. Tables and the default config rows get created automatically the first time you touch the database, so there's no separate migration step to remember.
+
+### Job lifecycle
+
+A job starts `pending`. A worker claims it (`processing`), runs the command, and depending on the exit code either marks it `completed` or increments its attempt count and decides between `failed` (there's backoff time to wait out before it's eligible again) and `dead` (out of retries, sitting in the DLQ until someone runs `dlq retry`).
+
+### Concurrency
+
+Claiming a job is a single `UPDATE ... RETURNING` inside a `BEGIN IMMEDIATE` transaction, so two workers racing for the same row serialize at the database rather than in application code — there's no separate "read the queue, then update" step that could race. Each claimed job is stamped with the worker's ID and a lock timestamp that gets renewed while the command runs; if a worker dies mid-job, a background reaper notices the stale lock after `lock-timeout-seconds` and requeues (or kills) the job on its behalf.
 
 ## Configuration
 
-| Key | Default | Validation | Meaning |
-| --- | ---: | --- | --- |
-| `max-retries` | `3` | `>= 1` | Default maximum total execution attempts for newly enqueued jobs. |
-| `backoff-base` | `2` | `>= 1` | Base used by `backoff_base ^ attempts`. |
-| `poll-interval-ms` | `500` | `>= 50` | Worker sleep duration when no job is available. |
-| `lock-timeout-seconds` | `120` | `>= 1` | Age after which a processing job is considered stale. |
-| `worker-stale-seconds` | `15` | `>= 1` | Heartbeat cutoff used by `queuectl status`. |
-| `stop-timeout-seconds` | `30` | `>= 1` | Graceful stop wait before SIGKILL. |
+Everything here is stored in SQLite and changed with `queuectl config set <key> <value>` — nothing is hardcoded.
 
-`max_retries` in enqueue JSON overrides the current `max-retries` config for that job only. Existing jobs keep their stored `max_retries` even if config changes later.
+| Key | Default | Must be | What it controls |
+| --- | ---: | --- | --- |
+| `max-retries` | `3` | `>= 1` | How many total attempts a new job gets before it's declared dead. |
+| `backoff-base` | `2` | `>= 1` | The base in `backoff_base ^ attempts` — how fast retry delays grow. |
+| `poll-interval-ms` | `500` | `>= 50` | How long an idle worker sleeps between checks for new work. |
+| `lock-timeout-seconds` | `120` | `>= 1` | How long a `processing` job can go without a heartbeat before the reaper assumes its worker died. |
+| `worker-stale-seconds` | `15` | `>= 1` | How recent a worker's heartbeat needs to be for `status` to count it as active. |
+| `stop-timeout-seconds` | `30` | `>= 1` | How long `worker stop` waits for a graceful shutdown before escalating to SIGKILL. |
+
+Note that `max_retries` set in the enqueue JSON only affects that one job — it doesn't touch the `max-retries` config, and existing jobs don't retroactively pick up a config change either. Each job keeps whatever `max_retries` it was created with.
 
 ## Testing
 
-Run unit tests:
+The unit tests cover the state machine, config validation, and the trickier storage-layer stuff (atomic claiming, lock fencing, stale-job recovery):
 
 ```bash
 go test ./...
 ```
 
-Run the integration script:
+For an end-to-end check, `scripts/test.sh` builds the binary, spins up a temporary database and three real workers, and walks through the scenarios the assignment asks for: a job that just completes, a job that fails its way into the DLQ with backoff in between, an invalid command failing gracefully, ten jobs fanned out across workers with no duplicate execution, and a completed job still being there after the workers are stopped and restarted. It's not mocked — it actually shells out and runs `queuectl`.
 
 ```bash
 bash scripts/test.sh
 ```
 
-The script builds `./queuectl`, creates a temporary DB, applies fast test config, starts multiple workers, verifies completion, DLQ movement, invalid command handling, no overlap across workers, persistence after worker stop, and DLQ retry.
-
 ## Assumptions And Trade-Offs
 
-- `max_retries` means maximum total execution attempts, not retries after the first attempt.
-- Commands run through `sh -c`, so they can use quotes, pipes, redirects, and environment variables.
-- Commands are trusted input. `queuectl` is not a sandbox.
-- The target OS is macOS/Linux.
-- Only one worker supervisor process per database path is supported at a time.
-- SIGTERM is graceful: workers stop claiming new jobs and finish current jobs.
-- SIGKILL is forced and may interrupt in-flight work; the reaper later recovers stale processing jobs.
-- `lock-timeout-seconds` must exceed normal job runtime. Long-running production jobs would need job heartbeat extension or explicit timeouts.
-- Workers renew processing job leases while commands run, and completion/failure updates are fenced by the current job lock owner.
-- The default database uses `.queuectl/worker.pid`; custom database paths use `.queuectl/worker-<hash>.pid` to avoid cross-database PID-file collisions.
+A few decisions worth calling out, in case they matter for how this gets evaluated:
+
+- **`max_retries` counts total attempts, not retries after the first failure.** So `max_retries: 3` means the job runs at most 3 times total, not 1 try + 3 retries. I went with this because it's what the field name in the assignment's job JSON implies, but it's worth flagging since "retries" is genuinely ambiguous.
+- **Commands run through `sh -c`**, not split and exec'd directly. This means pipes, quoting, redirects, and env vars all work like you'd expect from a shell — but it also means `queuectl` trusts whatever command it's given. There's no sandboxing here; don't point this at untrusted input.
+- Built and tested for **macOS/Linux**. No Windows support — `sh -c` doesn't exist there.
+- Only **one worker supervisor per database** at a time. Starting a second one against the same DB is refused rather than silently allowed, since two supervisors both renewing PID files and reaping jobs would just fight each other.
+- Shutdown is two-tiered: **SIGTERM is graceful** (workers stop picking up new jobs and let whatever they're running finish), **SIGKILL is not** (it can cut a job off mid-execution, but the reaper will notice the orphaned `processing` row on the next pass and put it back into circulation).
+- `lock-timeout-seconds` needs to comfortably exceed how long your jobs actually take to run — if a legitimate job runs past that window, the reaper can't tell it apart from a genuinely stuck one and will recover it out from under the worker still running it. Workers do renew their lease periodically while a command runs to push this out, but very long-running jobs would eventually want explicit timeout handling instead.
+- PID files: the default database uses `.queuectl/worker.pid`; anything opened with a custom `--db` gets its own hashed PID file (`.queuectl/worker-<hash>.pid`) so two differently-named queues don't stomp on each other's PID file.
