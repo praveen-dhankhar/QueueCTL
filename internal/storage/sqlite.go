@@ -89,8 +89,13 @@ func (s *Store) Path() string {
 
 func (s *Store) applyPragmas(ctx context.Context) error {
 	pragmas := []string{
-		"PRAGMA journal_mode = WAL;",
+		// busy_timeout must be set before journal_mode: converting a fresh
+		// database to WAL takes an exclusive lock, and without a busy
+		// timeout already in effect on this connection, a concurrent
+		// queuectl process opening the same new database file can fail
+		// with "database is locked" instead of retrying.
 		"PRAGMA busy_timeout = 5000;",
+		"PRAGMA journal_mode = WAL;",
 		"PRAGMA synchronous = NORMAL;",
 		"PRAGMA foreign_keys = ON;",
 	}
