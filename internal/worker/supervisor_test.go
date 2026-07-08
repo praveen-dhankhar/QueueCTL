@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -70,6 +71,60 @@ func TestEnsureNoLiveSupervisorRefusesLiveNonQueueCTLProcess(t *testing.T) {
 	err := EnsureNoLiveSupervisor(pidPath)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "non-queuectl process")
+}
+
+func TestClaimSupervisorPIDFileConcurrentOnlyOneWins(t *testing.T) {
+	pidPath := filepath.Join(t.TempDir(), "worker.pid")
+
+	const racers = 20
+	var wg sync.WaitGroup
+	var successes int32
+	var mu sync.Mutex
+	var errs []error
+
+	start := make(chan struct{})
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			err := ClaimSupervisorPIDFile(pidPath)
+			if err == nil {
+				mu.Lock()
+				successes++
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			errs = append(errs, err)
+			mu.Unlock()
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	require.EqualValues(t, 1, successes, "exactly one concurrent claim should win the PID file")
+	require.Len(t, errs, racers-1, "every other claim should fail rather than silently succeed")
+	for _, err := range errs {
+		// All racers share this test process's own PID, so the losing
+		// side's verification won't recognize it as "queuectl worker
+		// start" and will report a non-queuectl refusal rather than
+		// "already running" - either way, the point proven here is that
+		// it refuses instead of silently claiming the file too.
+		require.Contains(t, err.Error(), pidPath)
+	}
+}
+
+func TestClaimSupervisorPIDFileRemovesStaleAndClaims(t *testing.T) {
+	pidPath := filepath.Join(t.TempDir(), "worker.pid")
+	exitedPID := spawnAndWaitExited(t)
+	require.NoError(t, os.WriteFile(pidPath, []byte(strconv.Itoa(exitedPID)), 0o644))
+
+	require.NoError(t, ClaimSupervisorPIDFile(pidPath))
+
+	raw, err := os.ReadFile(pidPath)
+	require.NoError(t, err)
+	require.Equal(t, strconv.Itoa(os.Getpid()), string(raw))
 }
 
 func TestStopSupervisorMissingPIDFile(t *testing.T) {

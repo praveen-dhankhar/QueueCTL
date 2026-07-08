@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strconv"
 	"sync"
 	"time"
 
@@ -61,11 +60,8 @@ func (p *Pool) Start(ctx context.Context) error {
 	if err := appconfig.EnsureQueueDir(); err != nil {
 		return fmt.Errorf("create .queuectl directory: %w", err)
 	}
-	if err := EnsureNoLiveSupervisor(p.pidPath); err != nil {
+	if err := ClaimSupervisorPIDFile(p.pidPath); err != nil {
 		return err
-	}
-	if err := os.WriteFile(p.pidPath, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
-		return fmt.Errorf("write worker PID file: %w", err)
 	}
 	defer os.Remove(p.pidPath)
 

@@ -51,6 +51,44 @@ func EnsureNoLiveSupervisor(pidPath string) error {
 	return nil
 }
 
+// ClaimSupervisorPIDFile atomically claims pidPath for the calling process.
+// Callers must use this instead of calling EnsureNoLiveSupervisor followed
+// by a separate write: that two-step "check, then act" pattern lets two
+// "queuectl worker start" processes launched at nearly the same time both
+// pass the check before either has written the file, so both end up
+// believing they are the sole supervisor. Here, the exclusive create
+// (O_CREATE|O_EXCL) is itself the arbiter - the OS guarantees only one
+// caller can win it - and EnsureNoLiveSupervisor's checks are only
+// consulted on the losing side, to produce the right error (or to clear a
+// stale file left by a crashed supervisor and retry the claim once).
+func ClaimSupervisorPIDFile(pidPath string) error {
+	for attempt := 0; attempt < 2; attempt++ {
+		err := writePIDFileExclusive(pidPath, os.Getpid())
+		if err == nil {
+			return nil
+		}
+		if !os.IsExist(err) {
+			return fmt.Errorf("write worker PID file: %w", err)
+		}
+		if err := EnsureNoLiveSupervisor(pidPath); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("worker PID file %s could not be claimed", pidPath)
+}
+
+// writePIDFileExclusive creates pidPath only if it does not already exist,
+// so two concurrent callers can never both believe they created it.
+func writePIDFileExclusive(pidPath string, pid int) error {
+	f, err := os.OpenFile(pidPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(strconv.Itoa(pid))
+	return err
+}
+
 // StopSupervisor reads the PID file at pidPath, verifies it points at a
 // live "queuectl worker start" process, and sends SIGTERM. It waits up to
 // timeout for the process to exit before escalating to SIGKILL.
