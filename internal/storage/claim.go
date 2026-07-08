@@ -40,7 +40,7 @@ AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
 ORDER BY created_at ASC
 LIMIT 1
 )
-RETURNING id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, created_at, updated_at;`, workerID)
+RETURNING id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, locked_pgid, created_at, updated_at;`, workerID)
 
 		j, err := scanJob(row)
 		if errors.Is(err, sql.ErrNoRows) {

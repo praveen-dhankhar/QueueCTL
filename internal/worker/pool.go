@@ -143,7 +143,12 @@ func (p *Pool) executeJob(workerID string, claimed job.Job) {
 	leaseDone := make(chan struct{})
 	go p.renewJobLease(leaseCtx, workerID, claimed.ID, lease, leaseDone)
 
-	result := ExecuteCommand(context.Background(), claimed.Command)
+	onStart := func(pid int) {
+		if err := p.store.SetJobLockPGID(context.Background(), claimed.ID, workerID, pid); err != nil {
+			p.logRecordError("record job process group failed", workerID, claimed.ID, err)
+		}
+	}
+	result := ExecuteCommand(context.Background(), claimed.Command, onStart)
 	stopLease()
 	<-leaseDone
 	if lockedAt := lease.currentLockedAt(); lockedAt != nil {

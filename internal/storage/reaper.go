@@ -13,7 +13,7 @@ import (
 // because their worker likely crashed or stopped renewing its lease.
 func (s *Store) ListStaleProcessingJobs(ctx context.Context, lockTimeoutSeconds int) ([]job.Job, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, created_at, updated_at
+SELECT id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, locked_pgid, created_at, updated_at
 FROM jobs
 WHERE state = 'processing'
 AND locked_at < datetime('now', '-' || ? || ' seconds')
@@ -39,7 +39,7 @@ func (s *Store) RecoverStaleJob(ctx context.Context, j job.Job, attempts int, st
 	}
 	result, err := s.db.ExecContext(ctx, `
 UPDATE jobs
-SET attempts = ?, state = ?, next_retry_at = ?, locked_by = NULL, locked_at = NULL, updated_at = ?
+SET attempts = ?, state = ?, next_retry_at = ?, locked_by = NULL, locked_at = NULL, locked_pgid = NULL, updated_at = ?
 WHERE id = ? AND state = 'processing' AND locked_by = ? AND locked_at = ?;`,
 		attempts,
 		string(state),

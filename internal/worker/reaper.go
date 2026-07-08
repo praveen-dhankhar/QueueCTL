@@ -2,7 +2,9 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"syscall"
 	"time"
 
 	appconfig "queuectl/internal/config"
@@ -53,9 +55,36 @@ func RunReaperOnce(ctx context.Context, store *storage.Store, logger *slog.Logge
 			if logger != nil {
 				logger.Warn("recovered stale processing job", "job_id", stale.ID, "state", nextState, "attempts", attempts)
 			}
+			// The job's lock is fenced away from whatever worker held it,
+			// but the "sh -c" command it started may still be running (the
+			// worker could be wedged rather than dead, or this reaper could
+			// be a freshly restarted supervisor recovering a job orphaned
+			// by a killed one). Kill its process group so recovering the DB
+			// row doesn't leave a duplicate execution running unsupervised
+			// in the background.
+			if stale.LockedPGID != nil {
+				if err := killProcessGroup(*stale.LockedPGID); err != nil && logger != nil {
+					logger.Warn("failed to kill process group of recovered job", "job_id", stale.ID, "pgid", *stale.LockedPGID, "error", err)
+				}
+			}
 		}
 	}
 	return recovered, nil
+}
+
+// killProcessGroup sends SIGKILL to every process in the group led by
+// pgid (a negative PID targets the whole group rather than one process).
+// ESRCH - no such process/group - is not an error here: it just means the
+// command had already exited naturally before the reaper got to it.
+func killProcessGroup(pgid int) error {
+	if pgid <= 0 {
+		return nil
+	}
+	err := syscall.Kill(-pgid, syscall.SIGKILL)
+	if err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+	return nil
 }
 
 // RunReaperLoop calls RunReaperOnce every reaperInterval until ctx is

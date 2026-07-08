@@ -36,8 +36,8 @@ var validStates = map[State]struct{}{
 
 // Job is one unit of work: a shell command tracked through the state
 // machine above, with retry bookkeeping (Attempts/MaxRetries/NextRetryAt)
-// and lock ownership (LockedBy/LockedAt) used to fence claim/complete/fail
-// updates against concurrent workers and the reaper.
+// and lock ownership (LockedBy/LockedAt/LockedPGID) used to fence
+// claim/complete/fail updates against concurrent workers and the reaper.
 type Job struct {
 	ID          string
 	Command     string
@@ -47,8 +47,15 @@ type Job struct {
 	NextRetryAt *time.Time
 	LockedBy    *string
 	LockedAt    *time.Time
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// LockedPGID is the OS process-group ID leading the job's running "sh
+	// -c" command, recorded once the worker starts it. It lets the reaper
+	// kill the whole group (not just record the job as recovered) when it
+	// reclaims a stale lock, even if the reaper is running in a different
+	// queuectl process than the one that started the command (e.g. after a
+	// crashed supervisor was restarted).
+	LockedPGID *int
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // ValidateState reports an error if state is not one of the five known
@@ -109,6 +116,7 @@ func (j *Job) MarkProcessing(workerID string, now time.Time) error {
 	j.LockedBy = &workerID
 	lockedAt := now.UTC()
 	j.LockedAt = &lockedAt
+	j.LockedPGID = nil
 	j.UpdatedAt = lockedAt
 	return nil
 }
@@ -124,6 +132,7 @@ func (j *Job) MarkCompleted(now time.Time) error {
 	j.NextRetryAt = nil
 	j.LockedBy = nil
 	j.LockedAt = nil
+	j.LockedPGID = nil
 	j.UpdatedAt = now.UTC()
 	return nil
 }
@@ -146,6 +155,7 @@ func (j *Job) MarkFailedOrDead(nextRetryAt *time.Time, now time.Time) error {
 	}
 	j.LockedBy = nil
 	j.LockedAt = nil
+	j.LockedPGID = nil
 	j.UpdatedAt = now.UTC()
 	return nil
 }
@@ -162,6 +172,7 @@ func (j *Job) RetryFromDLQ(now time.Time) error {
 	j.NextRetryAt = nil
 	j.LockedBy = nil
 	j.LockedAt = nil
+	j.LockedPGID = nil
 	j.UpdatedAt = now.UTC()
 	return nil
 }

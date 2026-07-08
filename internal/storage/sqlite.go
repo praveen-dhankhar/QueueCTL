@@ -111,8 +111,8 @@ func (s *Store) applyPragmas(ctx context.Context) error {
 // error as a duplicate ID (jobs.id is the primary key).
 func (s *Store) InsertJob(ctx context.Context, j job.Job) error {
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO jobs(id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+INSERT INTO jobs(id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, locked_pgid, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
 		j.ID,
 		j.Command,
 		string(j.State),
@@ -121,6 +121,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
 		nullableTime(j.NextRetryAt),
 		nullableString(j.LockedBy),
 		nullableTime(j.LockedAt),
+		nullableInt(j.LockedPGID),
 		formatTime(j.CreatedAt),
 		formatTime(j.UpdatedAt),
 	)
@@ -133,7 +134,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
 // GetJob fetches a single job by ID.
 func (s *Store) GetJob(ctx context.Context, id string) (job.Job, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, created_at, updated_at
+SELECT id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, locked_pgid, created_at, updated_at
 FROM jobs WHERE id = ?;`, id)
 	return scanJob(row)
 }
@@ -141,7 +142,7 @@ FROM jobs WHERE id = ?;`, id)
 // ListJobs returns every job in the given state, oldest first.
 func (s *Store) ListJobs(ctx context.Context, state job.State) ([]job.Job, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, created_at, updated_at
+SELECT id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, locked_pgid, created_at, updated_at
 FROM jobs
 WHERE state = ?
 ORDER BY created_at ASC, id ASC;`, string(state))
@@ -294,6 +295,24 @@ RETURNING locked_at;`, jobID, workerID).Scan(&rawLockedAt)
 	return lockedAt, true, nil
 }
 
+// SetJobLockPGID records the OS process-group ID leading the job's running
+// command, fenced on the job still being processing and locked by
+// workerID. Persisting it lets the reaper kill the whole process group when
+// it later reclaims this job as stale, even from a different queuectl
+// process than the one that started the command (e.g. after a crashed
+// supervisor was restarted). Like RenewJobLock, it returns ErrJobLockLost
+// if the fence didn't match because the lock was already lost.
+func (s *Store) SetJobLockPGID(ctx context.Context, jobID string, workerID string, pgid int) error {
+	result, err := s.db.ExecContext(ctx, `
+UPDATE jobs
+SET locked_pgid = ?, updated_at = CURRENT_TIMESTAMP
+WHERE id = ? AND state = 'processing' AND locked_by = ?;`, pgid, jobID, workerID)
+	if err != nil {
+		return fmt.Errorf("set job lock pgid %s: %w", jobID, err)
+	}
+	return requireRowsAffected(result, "set job lock pgid")
+}
+
 // RecordJobSuccess inserts the job_runs row for a completed attempt and
 // marks the job completed in a single BEGIN IMMEDIATE transaction. The
 // UPDATE is fenced on state = 'processing' AND locked_by/locked_at matching
@@ -315,7 +334,7 @@ func (s *Store) RecordJobSuccess(ctx context.Context, j job.Job, run JobRun) err
 		}
 		result, err := conn.ExecContext(ctx, `
 UPDATE jobs
-SET attempts = ?, state = 'completed', next_retry_at = NULL, locked_by = NULL, locked_at = NULL, updated_at = ?
+SET attempts = ?, state = 'completed', next_retry_at = NULL, locked_by = NULL, locked_at = NULL, locked_pgid = NULL, updated_at = ?
 WHERE id = ? AND state = 'processing' AND locked_by = ? AND locked_at = ?;`,
 			attempt, formatTime(time.Now()), j.ID, lockedBy, lockedAt)
 		if err != nil {
@@ -345,7 +364,7 @@ func (s *Store) RecordJobFailure(ctx context.Context, j job.Job, run JobRun, nex
 		}
 		result, err := conn.ExecContext(ctx, `
 UPDATE jobs
-SET attempts = ?, state = ?, next_retry_at = ?, locked_by = NULL, locked_at = NULL, updated_at = ?
+SET attempts = ?, state = ?, next_retry_at = ?, locked_by = NULL, locked_at = NULL, locked_pgid = NULL, updated_at = ?
 WHERE id = ? AND state = 'processing' AND locked_by = ? AND locked_at = ?;`,
 			attempt, string(nextState), nullableTime(nextRetryAt), formatTime(time.Now()), j.ID, lockedBy, lockedAt)
 		if err != nil {
@@ -376,6 +395,50 @@ func (s *Store) JobRunCounts(ctx context.Context) (map[string]int, error) {
 		return nil, fmt.Errorf("iterate job run counts: %w", err)
 	}
 	return counts, nil
+}
+
+// ListJobRuns returns every recorded execution attempt for jobID, oldest
+// attempt first, for surfacing via "queuectl logs".
+func (s *Store) ListJobRuns(ctx context.Context, jobID string) ([]JobRun, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT job_id, worker_id, attempt, exit_code, stdout, stderr, started_at, finished_at
+FROM job_runs
+WHERE job_id = ?
+ORDER BY attempt ASC, started_at ASC;`, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("list job runs for %s: %w", jobID, err)
+	}
+	defer rows.Close()
+
+	var runs []JobRun
+	for rows.Next() {
+		var run JobRun
+		var exitCode sql.NullInt64
+		var startedAt string
+		var finishedAt sql.NullString
+		if err := rows.Scan(&run.JobID, &run.WorkerID, &run.Attempt, &exitCode, &run.Stdout, &run.Stderr, &startedAt, &finishedAt); err != nil {
+			return nil, fmt.Errorf("scan job run: %w", err)
+		}
+		if exitCode.Valid {
+			v := int(exitCode.Int64)
+			run.ExitCode = &v
+		}
+		run.StartedAt, err = parseTime(startedAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse started_at for job run: %w", err)
+		}
+		if finishedAt.Valid {
+			run.FinishedAt, err = parseTime(finishedAt.String)
+			if err != nil {
+				return nil, fmt.Errorf("parse finished_at for job run: %w", err)
+			}
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate job runs: %w", err)
+	}
+	return runs, nil
 }
 
 func jobLockFence(j job.Job) (string, string, error) {
@@ -447,6 +510,7 @@ func scanJob(row scanner) (job.Job, error) {
 	var nextRetryAt sql.NullString
 	var lockedBy sql.NullString
 	var lockedAt sql.NullString
+	var lockedPGID sql.NullInt64
 	var createdAt string
 	var updatedAt string
 
@@ -459,6 +523,7 @@ func scanJob(row scanner) (job.Job, error) {
 		&nextRetryAt,
 		&lockedBy,
 		&lockedAt,
+		&lockedPGID,
 		&createdAt,
 		&updatedAt,
 	); err != nil {
@@ -486,6 +551,10 @@ func scanJob(row scanner) (job.Job, error) {
 			return job.Job{}, fmt.Errorf("parse locked_at for job %s: %w", j.ID, err)
 		}
 		j.LockedAt = &t
+	}
+	if lockedPGID.Valid {
+		v := int(lockedPGID.Int64)
+		j.LockedPGID = &v
 	}
 	j.CreatedAt, err = parseTime(createdAt)
 	if err != nil {

@@ -2,11 +2,14 @@ package storage_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -16,6 +19,8 @@ import (
 	"queuectl/internal/job"
 	"queuectl/internal/storage"
 	"queuectl/internal/worker"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestStorageInsertListAndClaim(t *testing.T) {
@@ -300,6 +305,172 @@ func TestReaperMovesFinalAttemptToDead(t *testing.T) {
 	require.Equal(t, job.StateDead, got.State)
 	require.Equal(t, 2, got.Attempts)
 	require.Nil(t, got.NextRetryAt)
+}
+
+func TestSetJobLockPGIDFencing(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	now := time.Now().UTC()
+	j, err := job.New("pgid-job", "true", 3, now)
+	require.NoError(t, err)
+	require.NoError(t, store.InsertJob(ctx, j))
+
+	claimed, ok, err := store.ClaimNextJob(ctx, "worker1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Nil(t, claimed.LockedPGID, "pgid is unknown until the command actually starts")
+
+	require.NoError(t, store.SetJobLockPGID(ctx, claimed.ID, "worker1", 4242))
+	got, err := store.GetJob(ctx, claimed.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.LockedPGID)
+	require.Equal(t, 4242, *got.LockedPGID)
+
+	// A worker id that doesn't hold the current lock must not be able to
+	// overwrite the pgid recorded by whoever actually claimed the job.
+	err = store.SetJobLockPGID(ctx, claimed.ID, "worker-imposter", 9999)
+	require.ErrorIs(t, err, storage.ErrJobLockLost)
+}
+
+func TestListJobRuns(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	now := time.Now().UTC()
+	j, err := job.New("runs-job", "false", 2, now)
+	require.NoError(t, err)
+	require.NoError(t, store.InsertJob(ctx, j))
+
+	claimed, ok, err := store.ClaimNextJob(ctx, "worker1")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	exitCode := 1
+	run := storage.JobRun{
+		WorkerID:   "worker1",
+		ExitCode:   &exitCode,
+		Stdout:     "out1",
+		Stderr:     "err1",
+		StartedAt:  now,
+		FinishedAt: now,
+	}
+	retryAt := now.Add(time.Second)
+	require.NoError(t, store.RecordJobFailure(ctx, claimed, run, job.StateFailed, &retryAt))
+
+	runs, err := store.ListJobRuns(ctx, "runs-job")
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	require.Equal(t, 1, runs[0].Attempt)
+	require.Equal(t, "worker1", runs[0].WorkerID)
+	require.Equal(t, "out1", runs[0].Stdout)
+	require.Equal(t, "err1", runs[0].Stderr)
+	require.NotNil(t, runs[0].ExitCode)
+	require.Equal(t, 1, *runs[0].ExitCode)
+
+	noRuns, err := store.ListJobRuns(ctx, "no-such-job")
+	require.NoError(t, err)
+	require.Empty(t, noRuns)
+}
+
+// TestReaperKillsOrphanedProcessGroupOnRecovery reproduces the scenario the
+// process-group fix targets: a job's command is still actually running as
+// an OS process (e.g. the worker that started it is wedged and stopped
+// renewing its lease, or a previous supervisor was killed and a new one is
+// now recovering the row on startup) when the reaper decides its lock is
+// stale. Recovering the DB row must also kill the command's process group,
+// not just abandon it to keep running unsupervised.
+func TestReaperKillsOrphanedProcessGroupOnRecovery(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+	require.NoError(t, store.SetConfigInt(ctx, appconfig.KeyLockTimeoutSeconds, 1))
+
+	markerPath := filepath.Join(t.TempDir(), "marker")
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("sleep 5; touch %q", markerPath))
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	require.NoError(t, cmd.Start())
+	pgid := cmd.Process.Pid
+	t.Cleanup(func() {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		_ = cmd.Wait()
+	})
+
+	now := time.Now().UTC()
+	lockedBy := "worker1"
+	lockedAt := now.Add(-5 * time.Second)
+	stale, err := job.New("orphan", "sleep 5", 3, now.Add(-10*time.Second))
+	require.NoError(t, err)
+	stale.State = job.StateProcessing
+	stale.LockedBy = &lockedBy
+	stale.LockedAt = &lockedAt
+	stale.LockedPGID = &pgid
+	require.NoError(t, store.InsertJob(ctx, stale))
+
+	recovered, err := worker.RunReaperOnce(ctx, store, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, recovered)
+
+	waitErr := cmd.Wait()
+	require.Error(t, waitErr, "the orphaned process should have been killed, not exited cleanly")
+
+	_, statErr := os.Stat(markerPath)
+	require.True(t, os.IsNotExist(statErr), "process should have been killed before it could write the marker file")
+}
+
+// TestOpenAddsLockedPGIDColumnToPreExistingDatabase simulates upgrading
+// queuectl against a database created before the locked_pgid column
+// existed (e.g. jobs.sql from before the process-group fix): CREATE TABLE
+// IF NOT EXISTS is a no-op against an already-existing jobs table, so
+// Store.Open must add the column explicitly rather than silently losing
+// the ability to persist it - and must do so without disturbing rows
+// already in the table, since persistence across upgrades is a hard
+// requirement.
+func TestOpenAddsLockedPGIDColumnToPreExistingDatabase(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+
+	raw, err := sql.Open("sqlite", dbPath)
+	require.NoError(t, err)
+	_, err = raw.Exec(`CREATE TABLE jobs (
+id TEXT PRIMARY KEY,
+command TEXT NOT NULL,
+state TEXT NOT NULL,
+attempts INTEGER NOT NULL DEFAULT 0,
+max_retries INTEGER NOT NULL,
+next_retry_at DATETIME,
+locked_by TEXT,
+locked_at DATETIME,
+created_at DATETIME NOT NULL,
+updated_at DATETIME NOT NULL
+);`)
+	require.NoError(t, err)
+	_, err = raw.Exec(`INSERT INTO jobs(id, command, state, attempts, max_retries, created_at, updated_at)
+VALUES ('legacy1', 'echo hi', 'pending', 0, 3, '2026-01-01 00:00:00', '2026-01-01 00:00:00');`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+
+	ctx := context.Background()
+	store, err := storage.Open(ctx, dbPath)
+	require.NoError(t, err)
+	defer store.Close()
+
+	got, err := store.GetJob(ctx, "legacy1")
+	require.NoError(t, err)
+	require.Equal(t, "echo hi", got.Command)
+	require.Nil(t, got.LockedPGID)
+
+	require.NoError(t, store.SetConfigInt(ctx, appconfig.KeyLockTimeoutSeconds, 1))
+	claimed, ok, err := store.ClaimNextJob(ctx, "worker1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NoError(t, store.SetJobLockPGID(ctx, claimed.ID, "worker1", 777))
+
+	got, err = store.GetJob(ctx, "legacy1")
+	require.NoError(t, err)
+	require.NotNil(t, got.LockedPGID)
+	require.Equal(t, 777, *got.LockedPGID)
 }
 
 func newTestStore(t *testing.T) *storage.Store {

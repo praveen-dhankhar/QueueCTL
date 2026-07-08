@@ -62,8 +62,25 @@ fi
 run enqueue '{"id":"success","command":"echo hello","max_retries":1}'
 wait_for_state success completed
 
+if ! run logs success | grep -q "exit_code=0"; then
+  echo "logs command did not report a recorded successful attempt" >&2
+  run logs success >&2
+  exit 1
+fi
+if ! run logs success | grep -q "hello"; then
+  echo "logs command did not include the job's stdout" >&2
+  run logs success >&2
+  exit 1
+fi
+
 run enqueue '{"id":"fail-dlq","command":"exit 7","max_retries":2}'
 wait_for_state fail-dlq dead
+
+if [[ "$(run logs fail-dlq | grep -c 'attempt ')" != "2" ]]; then
+  echo "logs command did not report both recorded attempts for fail-dlq" >&2
+  run logs fail-dlq >&2
+  exit 1
+fi
 
 run enqueue '{"id":"invalid-command","command":"definitely-not-a-queuectl-command","max_retries":1}'
 wait_for_state invalid-command dead
