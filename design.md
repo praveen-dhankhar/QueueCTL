@@ -92,6 +92,8 @@ This avoids treating stale worker rows from crashed processes as active workers.
 
 Claimed jobs store `locked_by` and `locked_at`. While a command is running, the worker renews `locked_at` before the lock timeout can expire. Completion and failure updates are fenced by both `locked_by` and the latest `locked_at`; if the reaper or another worker has reclaimed the row, the old worker cannot mark that newer claim as completed or failed.
 
+Jobs also store `locked_pgid`: the OS process-group ID leading the job's `sh -c` command, set once the worker actually starts it (`Store.SetJobLockPGID`, itself fenced on `locked_by`). The command runs via `SysProcAttr{Setpgid: true}`, making it (and any children it spawns, e.g. in a pipeline) the sole members of a fresh process group rather than sharing queuectl's own. This is what lets the reaper do more than just update the row — see Crash Recovery Reaper below.
+
 ## Stop Design
 
 `queuectl worker stop` reads `.queuectl/worker.pid`, sends SIGTERM, and waits up to `stop-timeout-seconds`. On SIGTERM, workers stop claiming new jobs, finish in-flight jobs, delete worker rows, remove the PID file, and exit. If the process does not exit in time, `worker stop` sends SIGKILL.
@@ -102,12 +104,21 @@ Before signaling, `worker stop` verifies the PID actually belongs to a `queuectl
 
 If a worker process dies after claiming a job, that job can remain `processing`. The reaper runs once on worker startup and then every 30 seconds. It finds processing jobs whose `locked_at` is older than `lock-timeout-seconds`, increments attempts, and moves them to either `failed` with backoff or `dead`.
 
+Recovering the row is not the end of it: the reaper also sends `SIGKILL` to the job's process group (`-locked_pgid`), reading that column from the very row it just fenced away from its previous owner. This matters because reclaiming the *database* row does not, by itself, stop the *OS process* — a worker that stopped renewing its lease because it's wedged (not dead) can still be running the command, and a supervisor killed via `worker stop`'s SIGKILL escalation leaves its in-flight job's process group alive and orphaned (parent death does not kill children on Unix, and killing a single PID does not kill its process group). Group-killing on recovery closes that gap: once the reaper has moved a job on, its old execution is guaranteed to be gone too, so a subsequent re-claim of the same job can't run concurrently with a leftover copy of itself. This works even across process boundaries — the reaper that eventually recovers an orphan may be a freshly restarted supervisor, not the one that started the command, since `locked_pgid` is read from the database, not from any in-memory state. Sending the kill to a group whose leader has already exited naturally is a harmless no-op (`ESRCH`, swallowed).
+
+The residual gap: this cleanup only happens while a reaper is actually running, i.e. inside an active `queuectl worker start` process. If `worker stop` has to escalate to SIGKILL, the orphaned job's process group survives until the *next* `worker start`'s startup reaper pass, not instantly at stop time.
+
 Workers renew job leases during execution, but `lock-timeout-seconds` should still be greater than expected scheduling stalls and database pauses. Long-running production jobs would also benefit from explicit command timeouts and richer lease observability.
+
+## Job Output Logging
+
+Every execution attempt's stdout, stderr, exit code, and timestamps are persisted to `job_runs` regardless of outcome. `queuectl logs JOB_ID` lists them oldest-first, one block per attempt.
 
 ## Known Trade-Offs
 
 - SQLite is excellent for a local CLI queue, but distributed multi-host queues would need a server database or broker.
 - `sh -c` is flexible but assumes trusted input.
-- A forced SIGKILL can interrupt an in-flight command before a `job_runs` row is recorded; the reaper still advances the job so it does not stay stuck forever.
+- A forced SIGKILL can interrupt an in-flight command before a `job_runs` row is recorded; the reaper still advances the job (and now also kills its process group, see Crash Recovery Reaper) so it does not stay stuck forever.
 - Only one supervisor process per database path is allowed because PID-file process management is intentionally simple.
 - Worker config is read from SQLite rather than hardcoded, but some loop constants such as heartbeat and reaper cadence are fixed by the assignment.
+- Process-group kill is a coarse tool: it terminates the whole group with SIGKILL rather than attempting a graceful SIGTERM-then-wait against an orphaned job's own process tree, since by the time the reaper acts, that process is already considered lost and there is no one left to negotiate a graceful exit with.

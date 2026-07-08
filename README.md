@@ -87,6 +87,12 @@ Jobs that ran out of retries land in the DLQ — list them, and retry the ones w
 ./queuectl dlq retry job1
 ```
 
+Every execution attempt (stdout, stderr, exit code) is recorded, whether it succeeded or failed — look at a job's history with:
+
+```bash
+./queuectl logs job1
+```
+
 Tune the defaults (see the [Configuration](#configuration) table below for what each key does):
 
 ```bash
@@ -125,6 +131,8 @@ A job starts `pending`. A worker claims it (`processing`), runs the command, and
 
 Claiming a job is a single `UPDATE ... RETURNING` inside a `BEGIN IMMEDIATE` transaction, so two workers racing for the same row serialize at the database rather than in application code — there's no separate "read the queue, then update" step that could race. Each claimed job is stamped with the worker's ID and a lock timestamp that gets renewed while the command runs; if a worker dies mid-job, a background reaper notices the stale lock after `lock-timeout-seconds` and requeues (or kills) the job on its behalf.
 
+Job commands run as the leader of their own OS process group (not queuectl's own group), and that group's ID is persisted alongside the lock. When the reaper reclaims a stale job, it also sends `SIGKILL` to that whole process group, not just the DB row — so a job whose worker went silent (wedged, crashed, or killed via `worker stop`'s forced-shutdown path) doesn't keep running as an untracked orphan that could still be doing work (or racing a fresh execution of the same command) after the queue has already moved on from it.
+
 ## Configuration
 
 Everything here is stored in SQLite and changed with `queuectl config set <key> <value>` — nothing is hardcoded.
@@ -162,6 +170,6 @@ A few decisions worth calling out, in case they matter for how this gets evaluat
 - **Commands run through `sh -c`**, not split and exec'd directly. This means pipes, quoting, redirects, and env vars all work like you'd expect from a shell — but it also means `queuectl` trusts whatever command it's given. There's no sandboxing here; don't point this at untrusted input.
 - Built and tested for **macOS/Linux**. No Windows support — `sh -c` doesn't exist there.
 - Only **one worker supervisor per database** at a time. Starting a second one against the same DB is refused rather than silently allowed, since two supervisors both renewing PID files and reaping jobs would just fight each other.
-- Shutdown is two-tiered: **SIGTERM is graceful** (workers stop picking up new jobs and let whatever they're running finish), **SIGKILL is not** (it can cut a job off mid-execution, but the reaper will notice the orphaned `processing` row on the next pass and put it back into circulation).
+- Shutdown is two-tiered: **SIGTERM is graceful** (workers stop picking up new jobs and let whatever they're running finish), **SIGKILL is not** (it can cut a job off mid-execution). Either way, the job's command runs in its own OS process group, and the reaper kills that group (not just the DB row) once it notices the orphaned `processing` row on a later pass — so a forced shutdown doesn't leave the command running unsupervised in the background. That cleanup only happens once a `queuectl worker start` process is running its reaper again, so a job killed by `worker stop`'s SIGKILL escalation can stay orphaned until the next `worker start`, not instantly.
 - `lock-timeout-seconds` needs to comfortably exceed how long your jobs actually take to run — if a legitimate job runs past that window, the reaper can't tell it apart from a genuinely stuck one and will recover it out from under the worker still running it. Workers do renew their lease periodically while a command runs to push this out, but very long-running jobs would eventually want explicit timeout handling instead.
 - PID files: the default database uses `.queuectl/worker.pid`; anything opened with a custom `--db` gets its own hashed PID file (`.queuectl/worker-<hash>.pid`) so two differently-named queues don't stomp on each other's PID file.
