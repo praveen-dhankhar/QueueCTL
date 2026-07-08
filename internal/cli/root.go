@@ -29,6 +29,7 @@ func NewRootCommand() *cobra.Command {
 	root.AddCommand(newListCommand(&dbPathFlag))
 	root.AddCommand(newDLQCommand(&dbPathFlag))
 	root.AddCommand(newConfigCommand(&dbPathFlag))
+	root.AddCommand(newLogsCommand(&dbPathFlag))
 
 	return root
 }
