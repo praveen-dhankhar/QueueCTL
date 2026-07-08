@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 const (
@@ -19,7 +20,22 @@ const (
 	KeyLockTimeoutSeconds = "lock-timeout-seconds"
 	KeyWorkerStaleSeconds = "worker-stale-seconds"
 	KeyStopTimeoutSeconds = "stop-timeout-seconds"
+
+	// HeartbeatInterval is how often a running worker refreshes its
+	// workers.last_heartbeat row (internal/worker.Pool uses this constant
+	// directly rather than defining its own, so it can't drift out of sync
+	// with the worker-stale-seconds minimum derived from it below).
+	HeartbeatInterval = 5 * time.Second
 )
+
+// minWorkerStaleSeconds requires worker-stale-seconds to cover at least two
+// heartbeat intervals. status counts a worker active if its heartbeat is
+// newer than worker-stale-seconds ago; if that were allowed to be smaller
+// than (or close to) HeartbeatInterval, a perfectly healthy worker would
+// periodically - and incorrectly - be reported inactive in the gap between
+// two ordinary heartbeats, purely from configuring this value too small
+// rather than from any real staleness.
+var minWorkerStaleSeconds = int(2 * HeartbeatInterval / time.Second)
 
 var Defaults = map[string]int{
 	KeyMaxRetries:         3,
@@ -91,7 +107,7 @@ func ValidateConfigValue(key string, raw string) (int, error) {
 		KeyBackoffBase:        1,
 		KeyPollIntervalMS:     50,
 		KeyLockTimeoutSeconds: 1,
-		KeyWorkerStaleSeconds: 1,
+		KeyWorkerStaleSeconds: minWorkerStaleSeconds,
 		KeyStopTimeoutSeconds: 1,
 	}[key]
 	if !ok {

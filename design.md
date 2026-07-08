@@ -4,6 +4,8 @@
 
 SQLite keeps the assignment self-contained while still providing durable storage, transactions, constraints, and portable files. `modernc.org/sqlite` is used so the project does not depend on CGO. WAL mode improves read/write behavior for the CLI plus worker process model, and `busy_timeout` reduces transient lock failures.
 
+Schema setup (`CREATE TABLE IF NOT EXISTS`, additive `ALTER TABLE` for columns added after the initial schema, default config rows) runs inside a single `BEGIN IMMEDIATE` transaction on every `Store.Open`. This matters beyond atomicity: the additive-column check is a read-then-`ALTER TABLE`, and SQLite has no `ADD COLUMN IF NOT EXISTS`. Without the transaction, two `queuectl` processes racing to open the same pre-existing database for the first time after an upgrade could both see the column missing and both try to add it, and the loser would fail with "duplicate column name". Wrapping the whole migration in `BEGIN IMMEDIATE` means the loser blocks on SQLite's reserved lock until the winner commits, then re-checks and finds the column already there.
+
 ## Schema
 
 `jobs` stores the durable queue state. `config` stores runtime tuning values. `workers` stores supervisor goroutine heartbeats for status. `job_runs` records every completed execution attempt with stdout, stderr, exit code, and timestamps.
@@ -38,7 +40,7 @@ SELECT id
 FROM jobs
 WHERE state IN ('pending', 'failed')
 AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
-ORDER BY created_at ASC
+ORDER BY created_at ASC, rowid ASC
 LIMIT 1
 )
 RETURNING *;
@@ -46,11 +48,15 @@ RETURNING *;
 
 This prevents two workers from claiming the same job. Failed jobs are included only after `next_retry_at` so retry backoff is enforced by storage, not by worker memory.
 
+`created_at` is stored with one-second resolution, so jobs enqueued within the same wall-clock second tie on it. `rowid` — SQLite's implicit, monotonically increasing insertion-order column, present on any table not declared `WITHOUT ROWID` — breaks that tie in true insertion order. Job `id` itself is not a safe tiebreaker: an auto-generated id is random hex, unrelated to enqueue order. `queuectl list` orders the same way for the same reason.
+
 ## Worker Pool
 
 `queuectl worker start --count N` starts one foreground supervisor process and N goroutines. Each goroutine registers a worker row using `hostname:pid:worker-number`, heartbeats every 5 seconds, claims at most one job at a time, executes it to completion, and then repeats.
 
 Only one supervisor process per database path is supported. The default database uses `.queuectl/worker.pid`; custom database paths use a hashed PID file under `.queuectl/` so separate queues do not collide. Before sending stop signals, queuectl verifies that the PID file points to a `queuectl worker start` process.
+
+Each goroutine's job-execution step recovers from any panic raised while running or recording a job, logging it instead of letting it propagate. Without this, a single bad job (a bug surfaced by a particular command, a store call hitting an unexpected state) would crash the whole supervisor process and take every other in-flight job down with it. Recovery cancels that job's lease-renewal loop before returning, so its lock still ages out normally and the reaper picks the abandoned claim back up exactly as it would for a worker that crashed outright - the panic is contained to one job, not silently swallowed.
 
 ## Execution
 
@@ -86,7 +92,9 @@ Each worker updates `workers.last_heartbeat` every 5 seconds. `queuectl status` 
 last_heartbeat > now - worker-stale-seconds
 ```
 
-This avoids treating stale worker rows from crashed processes as active workers.
+This avoids treating stale worker rows from crashed processes as active workers. `worker-stale-seconds`'s minimum is enforced at twice the heartbeat cadence (10s): anything smaller and a perfectly healthy worker would periodically - and incorrectly - read as inactive in the ordinary gap between two heartbeats, which would be a self-inflicted flicker rather than a real staleness signal.
+
+A worker that exits gracefully deletes its own row as part of shutdown. One that is killed (SIGKILL, a crash) cannot, so its row would otherwise sit in `workers` forever. The reaper garbage-collects rows whose heartbeat is older than a much larger threshold (one hour) on every pass - large enough that it can only ever catch a row from a process that is unambiguously gone, never a worker that is merely slow to heartbeat.
 
 ## Job Lease Fencing
 

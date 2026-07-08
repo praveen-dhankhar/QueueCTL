@@ -3,6 +3,7 @@ package config_test
 import (
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -15,7 +16,7 @@ func TestValidateConfigValueAcceptsBoundaryMinimums(t *testing.T) {
 		appconfig.KeyBackoffBase:        1,
 		appconfig.KeyPollIntervalMS:     50,
 		appconfig.KeyLockTimeoutSeconds: 1,
-		appconfig.KeyWorkerStaleSeconds: 1,
+		appconfig.KeyWorkerStaleSeconds: int(2 * appconfig.HeartbeatInterval / time.Second),
 		appconfig.KeyStopTimeoutSeconds: 1,
 	}
 	for key, minimum := range minimums {
@@ -35,6 +36,20 @@ func TestValidateConfigValueRejectsBelowMinimum(t *testing.T) {
 
 	_, err = appconfig.ValidateConfigValue(appconfig.KeyLockTimeoutSeconds, "-1")
 	require.Error(t, err)
+}
+
+// TestValidateConfigValueRejectsWorkerStaleSecondsBelowHeartbeatMargin
+// guards the fix for a real status-flicker bug: worker-stale-seconds used
+// to accept any value >= 1, but the heartbeat that keeps a worker looking
+// "active" only fires every appconfig.HeartbeatInterval. A worker-stale-
+// seconds smaller than that would make `queuectl status` intermittently
+// report a perfectly healthy worker as inactive, purely from the gap
+// between two ordinary heartbeats - not from any actual staleness.
+func TestValidateConfigValueRejectsWorkerStaleSecondsBelowHeartbeatMargin(t *testing.T) {
+	tooSmall := int(2*appconfig.HeartbeatInterval/time.Second) - 1
+	_, err := appconfig.ValidateConfigValue(appconfig.KeyWorkerStaleSeconds, strconv.Itoa(tooSmall))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "worker-stale-seconds")
 }
 
 func TestValidateConfigValueRejectsNonInteger(t *testing.T) {

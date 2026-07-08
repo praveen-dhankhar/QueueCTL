@@ -104,6 +104,13 @@ Tune the defaults (see the [Configuration](#configuration) table below for what 
 ./queuectl config set stop-timeout-seconds 30
 ```
 
+Check what's currently set, either one key at a time or all of them:
+
+```bash
+./queuectl config get max-retries
+./queuectl config list
+```
+
 Running more than one queue side by side? Point each at its own database:
 
 ```bash
@@ -135,7 +142,7 @@ Job commands run as the leader of their own OS process group (not queuectl's own
 
 ## Configuration
 
-Everything here is stored in SQLite and changed with `queuectl config set <key> <value>` — nothing is hardcoded.
+Everything here is stored in SQLite and changed with `queuectl config set <key> <value>` — nothing is hardcoded. `queuectl config get <key>` and `queuectl config list` read it back.
 
 | Key | Default | Must be | What it controls |
 | --- | ---: | --- | --- |
@@ -143,7 +150,7 @@ Everything here is stored in SQLite and changed with `queuectl config set <key> 
 | `backoff-base` | `2` | `>= 1` | The base in `backoff_base ^ attempts` — how fast retry delays grow. |
 | `poll-interval-ms` | `500` | `>= 50` | How long an idle worker sleeps between checks for new work. |
 | `lock-timeout-seconds` | `120` | `>= 1` | How long a `processing` job can go without a heartbeat before the reaper assumes its worker died. |
-| `worker-stale-seconds` | `15` | `>= 1` | How recent a worker's heartbeat needs to be for `status` to count it as active. |
+| `worker-stale-seconds` | `15` | `>= 10` | How recent a worker's heartbeat needs to be for `status` to count it as active. The minimum is tied to the worker heartbeat cadence (every 5s): anything lower and a perfectly healthy worker would periodically show as inactive in the gap between two ordinary heartbeats. |
 | `stop-timeout-seconds` | `30` | `>= 1` | How long `worker stop` waits for a graceful shutdown before escalating to SIGKILL. |
 
 Note that `max_retries` set in the enqueue JSON only affects that one job — it doesn't touch the `max-retries` config, and existing jobs don't retroactively pick up a config change either. Each job keeps whatever `max_retries` it was created with.
