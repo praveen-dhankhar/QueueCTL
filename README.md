@@ -4,7 +4,7 @@
 
 I built this as a backend internship assignment, so the scope is deliberately focused: a single-host queue you run from the terminal, not a distributed job system.
 
-Demo video: <add (https://drive.google.com/file/d/1A1UNLaXX3Np2dR4Gjmx-bNcFtxluOHnr/view?usp=sharing)>
+Demo video: [watch here](https://drive.google.com/file/d/1A1UNLaXX3Np2dR4Gjmx-bNcFtxluOHnr/view?usp=sharing)
 
 ## Setup
 
@@ -182,41 +182,54 @@ A few decisions worth calling out, in case they matter for how this gets evaluat
 - PID files: the default database uses `.queuectl/worker.pid`; anything opened with a custom `--db` gets its own hashed PID file (`.queuectl/worker-<hash>.pid`) so two differently-named queues don't stomp on each other's PID file.
 
 
--Example 
+## Walkthrough
+
+A full run-through touching every command, using two terminals side by side.
+
+Build and check the CLI is there:
+
 ```bash
 go build -o queuectl ./cmd/queuectl
 ./queuectl --help
 ```
+
+Enqueue a job and check status:
+
 ```bash
 ./queuectl enqueue '{"id":"job1","command":"echo hello","max_retries":1}'
 ./queuectl status
 ```
--Right terminal
+
+**Terminal 1** — start the workers (this blocks):
+
 ```bash
 ./queuectl worker start --count 3
 ```
--in left terminal
+
+**Terminal 2** — watch it get picked up and check the logs:
+
 ```bash
 ./queuectl status
-```
-```bash
 ./queuectl logs job1
 ```
+
+Enqueue a job that's guaranteed to fail and watch it land in the DLQ:
 
 ```bash
 ./queuectl enqueue '{"id":"job-fail","command":"exit 7","max_retries":2}'
 ./queuectl status
-```
-
-```bash
 ./queuectl dlq list
 ./queuectl logs job-fail
 ```
+
+Retry it from the DLQ:
 
 ```bash
 ./queuectl dlq retry job-fail
 ./queuectl status
 ```
+
+Fan ten jobs out across the three workers:
 
 ```bash
 for i in $(seq 1 10); do
@@ -227,24 +240,34 @@ sleep 2
 ./queuectl status
 ```
 
+Stop the workers, then confirm a completed job survives the restart:
+
 ```bash
 ./queuectl worker stop
 ./queuectl status
 ```
--Right Terminal
+
+**Terminal 1** — start them back up:
+
 ```bash
 ./queuectl worker start --count 3
 ```
--Left terminal
+
+**Terminal 2**:
+
 ```bash
 ./queuectl status
 ```
+
+Tune config on the fly:
 
 ```bash
 ./queuectl config list
 ./queuectl config set max-retries 5
 ./queuectl config get max-retries
 ```
+
+Clean shutdown:
 
 ```bash
 ./queuectl worker stop
