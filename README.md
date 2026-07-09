@@ -4,7 +4,7 @@
 
 I built this as a backend internship assignment, so the scope is deliberately focused: a single-host queue you run from the terminal, not a distributed job system.
 
-Demo video: <add Google Drive / Loom link here before submission>
+Demo video: <add (https://drive.google.com/file/d/1A1UNLaXX3Np2dR4Gjmx-bNcFtxluOHnr/view?usp=sharing)>
 
 ## Setup
 
@@ -180,3 +180,72 @@ A few decisions worth calling out, in case they matter for how this gets evaluat
 - Shutdown is two-tiered: **SIGTERM is graceful** (workers stop picking up new jobs and let whatever they're running finish), **SIGKILL is not** (it can cut a job off mid-execution). Either way, the job's command runs in its own OS process group, and the reaper kills that group (not just the DB row) once it notices the orphaned `processing` row on a later pass — so a forced shutdown doesn't leave the command running unsupervised in the background. That cleanup only happens once a `queuectl worker start` process is running its reaper again, so a job killed by `worker stop`'s SIGKILL escalation can stay orphaned until the next `worker start`, not instantly.
 - `lock-timeout-seconds` needs to comfortably exceed how long your jobs actually take to run — if a legitimate job runs past that window, the reaper can't tell it apart from a genuinely stuck one and will recover it out from under the worker still running it. Workers do renew their lease periodically while a command runs to push this out, but very long-running jobs would eventually want explicit timeout handling instead.
 - PID files: the default database uses `.queuectl/worker.pid`; anything opened with a custom `--db` gets its own hashed PID file (`.queuectl/worker-<hash>.pid`) so two differently-named queues don't stomp on each other's PID file.
+
+
+-Example 
+```bash
+go build -o queuectl ./cmd/queuectl
+./queuectl --help
+```
+```bash
+./queuectl enqueue '{"id":"job1","command":"echo hello","max_retries":1}'
+./queuectl status
+```
+-Right terminal
+```bash
+./queuectl worker start --count 3
+```
+-in left terminal
+```bash
+./queuectl status
+```
+```bash
+./queuectl logs job1
+```
+
+```bash
+./queuectl enqueue '{"id":"job-fail","command":"exit 7","max_retries":2}'
+./queuectl status
+```
+
+```bash
+./queuectl dlq list
+./queuectl logs job-fail
+```
+
+```bash
+./queuectl dlq retry job-fail
+./queuectl status
+```
+
+```bash
+for i in $(seq 1 10); do
+  ./queuectl enqueue "{\"id\":\"multi-$i\",\"command\":\"echo processed-$i\",\"max_retries\":1}"
+done
+./queuectl status
+sleep 2
+./queuectl status
+```
+
+```bash
+./queuectl worker stop
+./queuectl status
+```
+-Right Terminal
+```bash
+./queuectl worker start --count 3
+```
+-Left terminal
+```bash
+./queuectl status
+```
+
+```bash
+./queuectl config list
+./queuectl config set max-retries 5
+./queuectl config get max-retries
+```
+
+```bash
+./queuectl worker stop
+```
