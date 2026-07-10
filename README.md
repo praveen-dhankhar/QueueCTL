@@ -6,6 +6,8 @@ I built this as a backend internship assignment, so the scope is deliberately fo
 
 Demo video: [watch here](https://drive.google.com/file/d/1A1UNLaXX3Np2dR4Gjmx-bNcFtxluOHnr/view?usp=sharing)
 
+See [DECISIONS.md](DECISIONS.md) for the specific design trade-offs (atomic claiming across processes, crash recovery timing, DLQ retry semantics, `worker stop` signaling, and what breaks if priorities were added).
+
 ## Setup
 
 You'll need:
@@ -42,13 +44,20 @@ Start a few workers. This runs in the foreground and blocks, so you'll want a se
 ./queuectl worker start --count 3
 ```
 
-When you're done, stop them gracefully — in-flight jobs get to finish before the process exits:
+You can run `worker start` more than once against the same database — from as many separate terminals as you like. Each invocation is its own OS process with its own goroutine pool; they all claim from the same queue and never duplicate work (see [Concurrency](#concurrency)):
+
+```bash
+# terminal 2, same database
+./queuectl worker start --count 2
+```
+
+When you're done, stop them all gracefully — in-flight jobs get to finish before each process exits — from any other terminal:
 
 ```bash
 ./queuectl worker stop
 ```
 
-`worker stop` double-checks the PID it's about to signal actually belongs to a `queuectl` process before sending anything. In a sandboxed environment where that check itself can't run (e.g. `ps` is blocked), skip it with `--force`:
+`worker stop` discovers every running supervisor for the database (see [Concurrency](#concurrency)) and double-checks each PID actually belongs to a `queuectl` process before signaling it. In a sandboxed environment where that check itself can't run (e.g. `ps` is blocked), skip it with `--force`:
 
 ```bash
 ./queuectl worker stop --force
@@ -78,6 +87,13 @@ Look at jobs in a given state:
 
 ```bash
 ./queuectl list --state pending
+```
+
+Add `--json` for a machine-readable array of job objects on stdout (and nothing else on stdout), for scripting:
+
+```bash
+./queuectl list --state pending --json
+# [{"id":"job1","command":"echo hello","state":"pending","attempts":0,"max_retries":3,"created_at":"2025-11-04T10:30:00Z","updated_at":"2025-11-04T10:30:00Z"}]
 ```
 
 Jobs that ran out of retries land in the DLQ — list them, and retry the ones worth retrying:
@@ -123,7 +139,7 @@ QUEUECTL_DB_PATH=./custom.db ./queuectl status
 I split the code into a few small packages rather than one flat `main.go`, mostly so the state machine and the SQL don't end up tangled with CLI parsing:
 
 - `internal/cli` — the Cobra commands themselves and how they format output.
-- `internal/config` — where the database lives, PID file naming, config validation.
+- `internal/config` — where the database lives, PID directory naming, config validation.
 - `internal/job` — the `Job` struct, its valid states, and the transitions between them.
 - `internal/storage` — everything SQLite: migrations, atomic claiming, DLQ updates, worker heartbeats, job run history.
 - `internal/worker` — the actual worker loop: claiming jobs, running commands, backoff math, lease renewal, the supervisor's PID handling, and the crash-recovery reaper.
@@ -136,9 +152,11 @@ A job starts `pending`. A worker claims it (`processing`), runs the command, and
 
 ### Concurrency
 
-Claiming a job is a single `UPDATE ... RETURNING` inside a `BEGIN IMMEDIATE` transaction, so two workers racing for the same row serialize at the database rather than in application code — there's no separate "read the queue, then update" step that could race. Each claimed job is stamped with the worker's ID and a lock timestamp that gets renewed while the command runs; if a worker dies mid-job, a background reaper notices the stale lock after `lock-timeout-seconds` and requeues (or kills) the job on its behalf.
+Claiming a job is a single `UPDATE ... RETURNING` inside a `BEGIN IMMEDIATE` transaction, so two workers racing for the same row serialize at the database rather than in application code — there's no separate "read the queue, then update" step that could race. This holds across processes, not just goroutines: any number of `queuectl worker start` invocations — including ones started from separate terminals — can run against the same database at once, and claiming still serializes at SQLite. Each claimed job is stamped with the worker's ID and a lock timestamp that gets renewed while the command runs; if a worker dies mid-job, a background reaper notices the stale lock after `lock-timeout-seconds` and requeues (or kills) the job on its behalf. See [DECISIONS.md](DECISIONS.md) for the exact lines and why the mechanism is atomic across OS processes.
 
 Job commands run as the leader of their own OS process group (not queuectl's own group), and that group's ID is persisted alongside the lock. When the reaper reclaims a stale job, it also sends `SIGKILL` to that whole process group, not just the DB row — so a job whose worker went silent (wedged, crashed, or killed via `worker stop`'s forced-shutdown path) doesn't keep running as an untracked orphan that could still be doing work (or racing a fresh execution of the same command) after the queue has already moved on from it.
+
+Each `worker start` process registers its own PID file (named after its own PID) in a shared directory under `.queuectl/`, rather than one process claiming a single exclusive PID file. `worker stop` scans that directory, verifies each live PID is actually a `queuectl worker start` process, and signals every one it finds — so it can stop any number of supervisors from a single invocation, from a different terminal than any of them.
 
 ## Configuration
 
@@ -149,7 +167,7 @@ Everything here is stored in SQLite and changed with `queuectl config set <key> 
 | `max-retries` | `3` | `>= 1` | How many total attempts a new job gets before it's declared dead. |
 | `backoff-base` | `2` | `>= 1` | The base in `backoff_base ^ attempts` — how fast retry delays grow. |
 | `poll-interval-ms` | `500` | `>= 50` | How long an idle worker sleeps between checks for new work. |
-| `lock-timeout-seconds` | `120` | `>= 1` | How long a `processing` job can go without a heartbeat before the reaper assumes its worker died. |
+| `lock-timeout-seconds` | `20` | `>= 1` | How long a `processing` job can go without a heartbeat before the reaper assumes its worker died. |
 | `worker-stale-seconds` | `15` | `>= 10` | How recent a worker's heartbeat needs to be for `status` to count it as active. The minimum is tied to the worker heartbeat cadence (every 5s): anything lower and a perfectly healthy worker would periodically show as inactive in the gap between two ordinary heartbeats. |
 | `stop-timeout-seconds` | `30` | `>= 1` | How long `worker stop` waits for a graceful shutdown before escalating to SIGKILL. |
 
@@ -163,7 +181,7 @@ The unit tests cover the state machine, config validation, and the trickier stor
 go test ./...
 ```
 
-For an end-to-end check, `scripts/test.sh` builds the binary, spins up a temporary database and three real workers, and walks through the scenarios the assignment asks for: a job that just completes, a job that fails its way into the DLQ with backoff in between, an invalid command failing gracefully, ten jobs fanned out across workers with no duplicate execution, and a completed job still being there after the workers are stopped and restarted. It's not mocked — it actually shells out and runs `queuectl`.
+For an end-to-end check, `scripts/test.sh` builds the binary, spins up a temporary database and three real workers, and walks through the scenarios the assignment asks for: a job that just completes, a job that fails its way into the DLQ with backoff in between, an invalid command failing gracefully, ten jobs fanned out across workers with no duplicate execution, a completed job still being there after the workers are stopped and restarted, two independent `worker start` processes (simulating separate terminals) sharing one queue with no duplicate execution, and a worker being `SIGKILL`ed mid-job with the job recovering and completing after restart. It's not mocked — it actually shells out and runs `queuectl`.
 
 ```bash
 bash scripts/test.sh
@@ -176,10 +194,10 @@ A few decisions worth calling out, in case they matter for how this gets evaluat
 - **`max_retries` counts total attempts, not retries after the first failure.** So `max_retries: 3` means the job runs at most 3 times total, not 1 try + 3 retries. I went with this because it's what the field name in the assignment's job JSON implies, but it's worth flagging since "retries" is genuinely ambiguous.
 - **Commands run through `sh -c`**, not split and exec'd directly. This means pipes, quoting, redirects, and env vars all work like you'd expect from a shell — but it also means `queuectl` trusts whatever command it's given. There's no sandboxing here; don't point this at untrusted input.
 - Built and tested for **macOS/Linux**. No Windows support — `sh -c` doesn't exist there.
-- Only **one worker supervisor per database** at a time. Starting a second one against the same DB is refused rather than silently allowed, since two supervisors both renewing PID files and reaping jobs would just fight each other.
+- **Any number of worker supervisors can run against the same database at once**, including ones started from separate terminals — each registers its own PID file rather than contending for one. `worker stop` discovers and signals all of them. Multiple reapers ticking concurrently is safe (each stale-job recovery is fenced) but is redundant work; harmless at this scale.
 - Shutdown is two-tiered: **SIGTERM is graceful** (workers stop picking up new jobs and let whatever they're running finish), **SIGKILL is not** (it can cut a job off mid-execution). Either way, the job's command runs in its own OS process group, and the reaper kills that group (not just the DB row) once it notices the orphaned `processing` row on a later pass — so a forced shutdown doesn't leave the command running unsupervised in the background. That cleanup only happens once a `queuectl worker start` process is running its reaper again, so a job killed by `worker stop`'s SIGKILL escalation can stay orphaned until the next `worker start`, not instantly.
-- `lock-timeout-seconds` needs to comfortably exceed how long your jobs actually take to run — if a legitimate job runs past that window, the reaper can't tell it apart from a genuinely stuck one and will recover it out from under the worker still running it. Workers do renew their lease periodically while a command runs to push this out, but very long-running jobs would eventually want explicit timeout handling instead.
-- PID files: the default database uses `.queuectl/worker.pid`; anything opened with a custom `--db` gets its own hashed PID file (`.queuectl/worker-<hash>.pid`) so two differently-named queues don't stomp on each other's PID file.
+- `lock-timeout-seconds` needs to comfortably exceed how long your jobs actually take to run — if a legitimate job runs past that window, the reaper can't tell it apart from a genuinely stuck one and will recover it out from under the worker still running it. Workers do renew their lease periodically while a command runs to push this out, but very long-running jobs would eventually want explicit timeout handling instead. The default (20s, with a reaper sweep every 10s) is tuned to keep worst-case crash recovery under the assignment's 60-second bound — see [DECISIONS.md](DECISIONS.md).
+- PID files: the default database uses `.queuectl/workers/`; anything opened with a custom `--db` gets its own hashed directory (`.queuectl/workers-<hash>/`) so two differently-named queues don't stomp on each other's PID files. Each running supervisor's own PID names its file within that directory.
 
 
 ## Walkthrough
@@ -213,6 +231,19 @@ Enqueue a job and check status:
 ./queuectl logs job1
 ```
 
+**Terminal 3** — start a second, independent supervisor against the same database, proving workers really are separate OS processes rather than just goroutines under one process:
+
+```bash
+./queuectl worker start --count 2
+```
+
+**Terminal 2** — `status` now reports 5 active workers (3 + 2) across two supervisor processes:
+
+```bash
+./queuectl status
+./queuectl list --state pending --json
+```
+
 Enqueue a job that's guaranteed to fail and watch it land in the DLQ:
 
 ```bash
@@ -240,7 +271,7 @@ sleep 2
 ./queuectl status
 ```
 
-Stop the workers, then confirm a completed job survives the restart:
+Stop every supervisor (both Terminal 1's and Terminal 3's) with a single `worker stop`, then confirm a completed job survives the restart:
 
 ```bash
 ./queuectl worker stop

@@ -1,0 +1,71 @@
+# DECISIONS.md
+
+Answers to the five required questions. Line numbers are current as of this commit; if the referenced files move, `grep` for the quoted symbol names to re-locate them.
+
+## 1. Which exact line(s) prevent two workers from claiming the same job, and why is that atomic across separate OS processes?
+
+The claim is one statement in [`internal/storage/claim.go:39-54`](internal/storage/claim.go#L39-L54):
+
+```sql
+UPDATE jobs
+SET state = 'processing', locked_by = ?, locked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+WHERE id = (
+  SELECT id FROM jobs
+  WHERE state IN ('pending', 'failed') AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
+  ORDER BY created_at ASC, rowid ASC
+  LIMIT 1
+)
+RETURNING id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, locked_pgid, created_at, updated_at;
+```
+
+There is no separate "SELECT the next job, then UPDATE it" from the application — the row selection and the state flip happen inside a single SQL statement, so there is no window between "read" and "write" for a second worker to slip into.
+
+That statement runs inside a raw `BEGIN IMMEDIATE` / `COMMIT` transaction, not `db.BeginTx` (`internal/storage/claim.go:77-103`, `withImmediateTx`). `BEGIN IMMEDIATE` acquires SQLite's RESERVED lock at the start of the transaction, rather than lazily on the first write the way `DEFERRED` (the implicit default, and the only mode `database/sql`'s `TxOptions` can express — it has no concept of SQLite's DEFERRED/IMMEDIATE/EXCLUSIVE modes) would. When two `queuectl worker start` processes — real, separate OS processes, e.g. one per terminal — both try to claim at the same instant, the loser's `BEGIN IMMEDIATE` blocks until the winner's transaction commits or rolls back. Once unblocked, the loser's `UPDATE ... WHERE id = (SELECT ...)` re-evaluates the subquery from scratch and either finds a different pending job or finds none — it can never re-claim the row the winner just took, because the winner's `COMMIT` already changed that row's `state` to `'processing'` before the loser's statement runs.
+
+This isn't a Go-level mutex, so it holds regardless of whether the two callers are goroutines in one process or two independent binaries: the mutual exclusion is SQLite's own lock file (`queuectl.db-wal`/`-shm` under WAL mode), which is visible and honored by any process that opens the same database file, OS-process boundaries included. Within a single process, `Store.db` is additionally capped to one physical connection (`SetMaxOpenConns(1)`/`SetMaxIdleConns(1)`, `internal/storage/sqlite.go:65-66`) so concurrent goroutines in that process serialize on the same connection before they'd even reach SQLite's own lock — belt-and-suspenders, not what makes the claim atomic across processes.
+
+`ORDER BY created_at ASC, rowid ASC` (not just `created_at`) breaks ties between jobs enqueued in the same wall-clock second: `created_at` has one-second resolution, but `rowid` is SQLite's implicit, strictly-insertion-ordered column, so same-second jobs still claim in true FIFO order.
+
+## 2. A worker is SIGKILLed halfway through a job. Walk through, step by step, what state the job is in and how it eventually runs again. What is the worst-case delay?
+
+1. Worker A claims the job: `state='processing'`, `locked_by='A'`, `locked_at=T0`, and once the command actually starts, `locked_pgid` is set to the new process group leading `sh -c <command>` (`internal/worker/executor.go`, `Setpgid: true`).
+2. While the command runs, worker A renews `locked_at` on a timer (`internal/worker/pool.go`, `renewJobLease`/`RenewJobLock`) — at most every 5s, at least every `lock-timeout-seconds/3` (`lockRenewalInterval`, floored at 250ms, capped at 5s).
+3. Worker A's OS process receives `SIGKILL`. No Go code runs — no defer, no signal handler, nothing. The job row is left exactly as it was after the last successful renewal: `state='processing'`, `locked_at=`(that last renewal), `locked_by='A'`. The `sh -c` child process itself is *not* killed by this — SIGKILLing the parent doesn't touch children on Unix — so the command may keep running, orphaned, under its own process group.
+4. The row now sits in `processing` with a lock nobody is renewing. Nothing in the database itself has "detected" anything yet.
+5. Any running `queuectl worker start` process's reaper — its own, or a different supervisor process entirely if one is running against the same DB — eventually notices. `RunReaperOnce` (`internal/worker/reaper.go`) calls `ListStaleProcessingJobs` (`internal/storage/reaper.go:14`), which selects rows where `locked_at < now - lock-timeout-seconds` (default 20s, `internal/config/config.go`, `Defaults[KeyLockTimeoutSeconds]`).
+6. Once flagged stale, `RecoverStaleJob` does a fenced `UPDATE ... WHERE state='processing' AND locked_by=? AND locked_at=?` moving the job to `failed` (with a fresh `next_retry_at` backoff) or straight to `dead` if `attempts+1 >= max_retries`. The fence means if worker A had actually still been alive and renewed the lease a moment before this ran, the UPDATE affects zero rows and nothing is stolen out from under it.
+7. The reaper also sends `SIGKILL` to the whole process group at the row's `locked_pgid` (`internal/worker/reaper.go`, `killProcessGroup`), so the orphaned command from step 3 is guaranteed to actually stop, closing the gap where a stale DB row and a still-running duplicate process could otherwise coexist.
+8. If the job moved to `failed`, it becomes claimable again once `next_retry_at` elapses, and any worker's normal poll loop (default every 500ms, `poll-interval-ms`) picks it up and runs it again like any other retry.
+
+**Worst-case delay**: `lock-timeout-seconds` (20s default) is the staleness threshold, and `RunReaperLoop` sweeps every `appconfig.ReaperInterval` (10s, `internal/config/config.go`). The worst case is a renewal at `T0`, the kill an instant later, and the reaper having *just* swept a moment before `T0+20s` — so the row isn't stale yet on that pass, and the next sweep is up to another 10s away. Worst case ≈ **20 + 10 = 30 seconds**, comfortably under the assignment's 60-second bound, with a 2x margin to absorb scheduling jitter on a loaded machine. (There's also a `RunReaperOnce` call at every `worker start`'s own startup, in addition to the periodic loop, so a fresh supervisor coming up after a crash recovers any already-stale job immediately rather than waiting for its first tick.)
+
+Earlier defaults (`lock-timeout-seconds=120`, reaper every 30s) gave a worst case of ~150s — well outside the requirement. This was a real bug, not a stylistic choice; the numbers above are the fix.
+
+## 3. Does `dlq retry` reset `attempts`? Why is that the right call?
+
+Yes — `RetryDeadJob` (`internal/storage/reaper.go`) sets `attempts = 0` when moving a job from `dead` back to `pending`, while preserving the original `id`, `command`, and `max_retries`.
+
+Reasoning: a job only reaches `dead` after exhausting every attempt it was originally given. If `dlq retry` preserved `attempts = max_retries`, the very next failure would move it straight back to `dead` with zero further retries — the job would only ever get one more try no matter how many times an operator retries it from the DLQ, which defeats the purpose of a manual retry (the operator presumably believes the underlying cause — a flaky dependency, a bad deploy — has been fixed, and wants the job to get its *full* retry budget against the new conditions, not a fractional leftover). Resetting to zero treats a DLQ retry as "give this job a fresh, complete run," which matches what "retry" means to an operator clicking (or scripting) it, and keeps the backoff schedule (`base^attempts`) starting from the same first-failure delay as any other job rather than jumping straight to the longest backoff tier.
+
+The trade-off: this makes DLQ retries indistinguishable from a brand-new job's attempt history, so `attempts` alone doesn't tell you "this job has failed and been retried from the DLQ N times before." If that history mattered (e.g. to eventually give up on a job that's been DLQ-retried too many times), it would need a separate counter — `dlq_retry_count` — rather than overloading `attempts`. Out of scope here, but worth flagging as the honest limitation of this choice.
+
+## 4. What designs did you consider and reject for `worker stop` (cross-process signaling), and why?
+
+**Chosen: a directory of per-process PID files.** Every `queuectl worker start` process registers its own file, named after its own PID (`<pid>.pid`), inside `.queuectl/workers/` (or a hashed variant per `--db` target) — see `RegisterSupervisor` in `internal/worker/supervisor.go`. `queuectl worker stop` lists that directory, verifies each live PID's command line actually looks like `queuectl worker start` (via `/proc/<pid>/cmdline` or `ps -p <pid> -o command=`), and sends `SIGTERM` to every one it can verify, escalating to `SIGKILL` for any that don't exit within `stop-timeout-seconds` (`StopAllSupervisors`). This is what lets any number of supervisors — including ones started from separate terminals, which the assignment calls out explicitly — coexist against one database and all be discovered and stopped by a single `worker stop` invocation from yet another terminal.
+
+This directory design is actually a revision: the first version used one *shared, exclusively-claimed* PID file per database (`O_CREATE|O_EXCL`), which made a second `worker start` against the same DB refuse to start at all with "worker supervisor already running." That was a genuine bug against "Multiple workers run in parallel — including workers started from separate terminal sessions (separate OS processes, not just threads)" — verified by actually running two `worker start` processes against the same DB and watching the second one exit immediately. The fix keeps the same PID-file mechanism (still O_EXCL per file, still verified via `/proc`/`ps` before signaling) but keys each file on its own process's PID instead of contesting one shared name, which costs nothing since the OS already guarantees PIDs are unique among live processes.
+
+**Rejected: a control socket** (`worker start` listens on a Unix domain socket; `worker stop` connects and sends a stop RPC). Rejected because it doesn't actually simplify the multi-process case — you'd still need a *directory* of sockets (one per supervisor) to discover them all, which is the same discovery problem PID files already solve, plus a hand-rolled protocol/handshake on top, plus a second kind of stale-file cleanup (abandoned socket files after a `SIGKILL`) with no better story than PID files already have. Signals are already the OS-native "stop this specific process" primitive; a socket adds a layer without adding a capability.
+
+**Rejected: a DB-row-based stop flag** (a `stop_requested` column or row per worker id in SQLite; each worker polls it in its own loop). Rejected because it trades an instant, OS-guaranteed signal for a polling delay bounded by `poll-interval-ms` (default 500ms — not terrible, but strictly worse than SIGTERM's immediacy for no benefit), and because it has no equivalent of `SIGKILL` for a genuinely wedged worker that has stopped even checking the database — a row can't force a stuck process to do anything, whereas the current design's SIGKILL escalation actually can. It also would have meant duplicating "am I still the right owner of this claim" bookkeeping that the lock-fencing logic already handles for lease renewal, for no reason.
+
+## 5. If priorities were added tomorrow (high-priority jobs jump the queue), what survives and what breaks?
+
+**Survives unchanged:** the storage engine and schema-evolution approach (SQLite + additive `ALTER TABLE`, the same pattern already used for `locked_pgid`); the entire atomicity mechanism from Q1 — priority is just another predicate/`ORDER BY` term inside the *same* single `UPDATE ... RETURNING` statement, so claiming stays exactly as atomic as it is today, no new locking needed; the crash-recovery reaper (keys off `locked_at` staleness, independent of priority); lease renewal/fencing; the worker pool/goroutine model; the PID-directory-based `worker stop` design from Q4; retry/backoff/DLQ semantics from Q2/Q3; and the config system.
+
+**Breaks / needs to change:**
+- Schema: add `priority INTEGER NOT NULL DEFAULT 0` via the same additive-column pattern `ensureColumn` already uses for `locked_pgid` (`internal/storage/migrations.go`).
+- The claim query's `ORDER BY created_at ASC, rowid ASC` (`internal/storage/claim.go:51`, and the matching clause in `ListJobs`) becomes `ORDER BY priority DESC, created_at ASC, rowid ASC` — highest priority wins, existing FIFO tiebreakers apply within a priority tier unchanged.
+- `idx_jobs_claimable` (currently `(state, next_retry_at, created_at)`) needs `priority` added so the claim subquery's `ORDER BY ... LIMIT 1` stays an index lookup instead of degrading to a full table sort as the queue grows.
+- `job.Job` / `job.New` gain a `Priority` field; `enqueue`'s JSON input gains an optional `"priority"` field (defaulting to 0); `list`'s table and `--json` output gain a `priority` column/field.
+- One real design call, not just plumbing: does priority let a job jump *before* its own backoff window elapses? I'd keep `next_retry_at <= now` as a hard gate regardless of priority — a high-priority job that's mid-backoff is still exempt from being claimed until its delay is up, so priority reorders *eligible* jobs but can't be used to skip a job's own retry punishment. That's a deliberate trade-off worth stating explicitly if this is ever built for real, not an accident of the query.
