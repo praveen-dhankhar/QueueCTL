@@ -33,42 +33,46 @@ var executeCommandFn = ExecuteCommand
 // claiming and executing jobs, alongside heartbeat, lease-renewal, and
 // reaper background loops.
 type Pool struct {
-	store   *storage.Store
-	count   int
-	pidPath string
-	logger  *slog.Logger
+	store  *storage.Store
+	count  int
+	pidDir string
+	logger *slog.Logger
 }
 
-// NewPool constructs a Pool. If logger is nil, a default stderr text
-// logger is used.
-func NewPool(store *storage.Store, count int, pidPath string, logger *slog.Logger) *Pool {
+// NewPool constructs a Pool. pidDir is the directory this supervisor
+// process registers its own PID file into (see RegisterSupervisor); any
+// number of Pools/processes may point at the same pidDir concurrently,
+// including ones started from separate terminals. If logger is nil, a
+// default stderr text logger is used.
+func NewPool(store *storage.Store, count int, pidDir string, logger *slog.Logger) *Pool {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
 	return &Pool{
-		store:   store,
-		count:   count,
-		pidPath: pidPath,
-		logger:  logger,
+		store:  store,
+		count:  count,
+		pidDir: pidDir,
+		logger: logger,
 	}
 }
 
-// Start writes the worker PID file, runs the startup reaper pass, launches
-// the reaper loop and count worker goroutines, then blocks until ctx is
-// canceled. On cancellation it waits for all in-flight jobs to finish
-// (workers stop claiming new jobs but do not abandon a running one) before
-// stopping the reaper, cleaning up worker rows, and removing the PID file.
+// Start registers this process's worker PID file, runs the startup reaper
+// pass, launches the reaper loop and count worker goroutines, then blocks
+// until ctx is canceled. On cancellation it waits for all in-flight jobs to
+// finish (workers stop claiming new jobs but do not abandon a running one)
+// before stopping the reaper, cleaning up worker rows, and removing its own
+// PID file. Multiple Pools (in separate processes) may run this
+// concurrently against the same pidDir/database; each only ever manages its
+// own PID file and its own worker goroutines.
 func (p *Pool) Start(ctx context.Context) error {
 	if p.count < 1 {
 		return errors.New("worker count must be >= 1")
 	}
-	if err := appconfig.EnsureQueueDir(); err != nil {
-		return fmt.Errorf("create .queuectl directory: %w", err)
-	}
-	if err := ClaimSupervisorPIDFile(p.pidPath); err != nil {
+	pidFile, err := RegisterSupervisor(p.pidDir)
+	if err != nil {
 		return err
 	}
-	defer os.Remove(p.pidPath)
+	defer os.Remove(pidFile)
 
 	if _, err := RunReaperOnce(ctx, p.store, p.logger); err != nil {
 		return fmt.Errorf("startup reaper: %w", err)

@@ -43,7 +43,7 @@ func TestExecuteJobRecoversPanicAndLeavesJobForReaper(t *testing.T) {
 	require.True(t, ok)
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	pool := NewPool(store, 1, appconfig.WorkerPIDPath(dbPath), logger)
+	pool := NewPool(store, 1, appconfig.WorkerPIDDir(dbPath), logger)
 
 	original := executeCommandFn
 	executeCommandFn = func(ctx context.Context, command string, onStart func(pid int)) ExecutionResult {

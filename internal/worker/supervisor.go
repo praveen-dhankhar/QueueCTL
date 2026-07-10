@@ -1,80 +1,55 @@
 package worker
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	osexec "os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
-// EnsureNoLiveSupervisor guards against starting a second worker
-// supervisor over the same database. It reads the PID file at pidPath and:
-//   - returns nil if no PID file exists;
-//   - returns nil (after deleting the file) if the recorded PID is not
-//     alive, i.e. the previous supervisor crashed without cleaning up;
-//   - returns an error if the PID is alive and verified (via
-//     processCommand) to be a "queuectl worker start" process, since that
-//     is an already-running supervisor;
-//   - returns an error if the PID is alive but does not look like
-//     queuectl, since signaling or overwriting that PID file would be
-//     unsafe;
-//   - returns an error if the process command could not be verified at
-//     all (e.g. /proc and ps are both unavailable), since it's safer to
-//     block a start than risk running two supervisors against one
-//     database.
-func EnsureNoLiveSupervisor(pidPath string) error {
-	pid, err := readPID(pidPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+// RegisterSupervisor claims this process's own PID file inside pidDir,
+// creating the directory if needed, and returns the file's path for the
+// caller to remove on graceful shutdown.
+//
+// Unlike a single shared PID file, this never refuses a second supervisor:
+// any number of "queuectl worker start" processes - including ones started
+// from separate terminals - can each register their own file in the same
+// directory, which is what lets "queuectl worker stop" (see
+// StopAllSupervisors) discover and signal every one of them. The filename
+// is the calling process's own PID, which the OS guarantees is not held by
+// any other currently-running process, so two live supervisors can never
+// contend for the same path. If a file already exists at that exact path,
+// it can only be a leftover from an earlier, now-dead process that
+// happened to reuse this PID (the OS would not have handed out a PID that
+// was already in use), so it is safe to remove and reclaim without an
+// aliveness check.
+func RegisterSupervisor(pidDir string) (string, error) {
+	if err := os.MkdirAll(pidDir, 0o755); err != nil {
+		return "", fmt.Errorf("create worker pid directory: %w", err)
 	}
-	if err != nil {
-		return err
-	}
-	if isProcessAlive(pid) {
-		ok, command, err := isQueueCTLSupervisor(pid)
-		if err != nil {
-			return fmt.Errorf("worker PID file %s points to live PID %d, but queuectl could not verify the process: %w", pidPath, pid, err)
-		}
-		if !ok {
-			return fmt.Errorf("worker PID file %s points to live non-queuectl process PID %d (%q); remove the stale PID file manually", pidPath, pid, command)
-		}
-		return fmt.Errorf("worker supervisor already running with PID %d", pid)
-	}
-	if err := os.Remove(pidPath); err != nil {
-		return fmt.Errorf("remove stale worker PID file: %w", err)
-	}
-	return nil
-}
-
-// ClaimSupervisorPIDFile atomically claims pidPath for the calling process.
-// Callers must use this instead of calling EnsureNoLiveSupervisor followed
-// by a separate write: that two-step "check, then act" pattern lets two
-// "queuectl worker start" processes launched at nearly the same time both
-// pass the check before either has written the file, so both end up
-// believing they are the sole supervisor. Here, the exclusive create
-// (O_CREATE|O_EXCL) is itself the arbiter - the OS guarantees only one
-// caller can win it - and EnsureNoLiveSupervisor's checks are only
-// consulted on the losing side, to produce the right error (or to clear a
-// stale file left by a crashed supervisor and retry the claim once).
-func ClaimSupervisorPIDFile(pidPath string) error {
+	path := pidFilePath(pidDir, os.Getpid())
 	for attempt := 0; attempt < 2; attempt++ {
-		err := writePIDFileExclusive(pidPath, os.Getpid())
+		err := writePIDFileExclusive(path, os.Getpid())
 		if err == nil {
-			return nil
+			return path, nil
 		}
 		if !os.IsExist(err) {
-			return fmt.Errorf("write worker PID file: %w", err)
+			return "", fmt.Errorf("write worker pid file: %w", err)
 		}
-		if err := EnsureNoLiveSupervisor(pidPath); err != nil {
-			return err
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return "", fmt.Errorf("remove stale worker pid file: %w", err)
 		}
 	}
-	return fmt.Errorf("worker PID file %s could not be claimed", pidPath)
+	return "", fmt.Errorf("worker pid file %s could not be claimed", path)
+}
+
+func pidFilePath(pidDir string, pid int) string {
+	return filepath.Join(pidDir, strconv.Itoa(pid)+".pid")
 }
 
 // writePIDFileExclusive creates pidPath only if it does not already exist,
@@ -89,99 +64,144 @@ func writePIDFileExclusive(pidPath string, pid int) error {
 	return err
 }
 
-// StopSupervisor reads the PID file at pidPath, verifies it points at a
-// live "queuectl worker start" process, and sends SIGTERM. It waits up to
-// timeout for the process to exit before escalating to SIGKILL.
+// StopAllSupervisors discovers every "queuectl worker start" process
+// registered under pidDir (one PID file per supervisor, written by
+// RegisterSupervisor), sends each a graceful SIGTERM, and waits up to
+// timeout total for all of them to exit before escalating any stragglers to
+// SIGKILL. Every discovered PID is reported to out as it is handled, so a
+// caller running "queuectl worker stop" from a different terminal than any
+// of the workers can see exactly what was signaled.
 //
-// Process verification (via processCommand) shells out to `ps` on
-// platforms without /proc (e.g. macOS). In sandboxed environments where
-// exec is blocked, verification itself fails with an error rather than a
-// definitive yes/no, which would otherwise leave `worker stop` unable to
-// stop a supervisor it started. If force is true, a verification failure
-// is downgraded to a warning on out and the stop proceeds; a definitive
-// "this PID is not queuectl" result still refuses to signal the process
-// regardless of force.
-func StopSupervisor(pidPath string, timeout time.Duration, out io.Writer, force bool) error {
-	pid, err := readPID(pidPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("worker PID file %s does not exist", pidPath)
-	}
+// A PID file whose process is no longer alive is treated as a stale
+// leftover (from a graceful exit that raced this call, or a prior SIGKILL
+// escalation that couldn't clean up after itself) and removed rather than
+// signaled. A PID file whose process is alive but does not look like
+// queuectl is left untouched and never signaled, with or without force;
+// see isQueueCTLSupervisor for what "looks like queuectl" means and why
+// verification can fail outright in sandboxed environments.
+//
+// It returns an error only if there was nothing to stop at all: no PID
+// directory, no PID files in it, or every PID file present turned out to be
+// stale or unverifiable/non-queuectl. That mirrors the single-supervisor
+// version's behavior of failing when there's no running worker to stop,
+// while still succeeding as long as at least one real supervisor was
+// signaled.
+func StopAllSupervisors(pidDir string, timeout time.Duration, out io.Writer, force bool) error {
+	entries, err := os.ReadDir(pidDir)
 	if err != nil {
-		return err
+		if os.IsNotExist(err) {
+			return fmt.Errorf("no worker supervisors running (pid directory %s does not exist)", pidDir)
+		}
+		return fmt.Errorf("read worker pid directory %s: %w", pidDir, err)
 	}
 
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("find worker supervisor PID %d: %w", pid, err)
-	}
-	if !isProcessAlive(pid) {
-		_ = os.Remove(pidPath)
-		return fmt.Errorf("worker supervisor PID %d is not running; removed stale PID file", pid)
-	}
-	ok, command, err := isQueueCTLSupervisor(pid)
-	if err != nil {
-		if !force {
-			return fmt.Errorf("worker PID file %s points to live PID %d, but queuectl could not verify the process: %w (retry with --force to skip verification)", pidPath, pid, err)
+	var signaled []int
+	found := false
+	for _, entry := range entries {
+		pid, ok := parsePIDFilename(entry.Name())
+		if !ok {
+			continue
 		}
-		if _, printErr := fmt.Fprintf(out, "warning: could not verify process PID %d (%v); proceeding because --force was set\n", pid, err); printErr != nil {
+		found = true
+		path := filepath.Join(pidDir, entry.Name())
+
+		if !isProcessAlive(pid) {
+			_ = os.Remove(path)
+			continue
+		}
+
+		ok, command, err := isQueueCTLSupervisor(pid)
+		if err != nil {
+			if !force {
+				if _, printErr := fmt.Fprintf(out, "warning: could not verify PID %d (%v); skipping (retry with --force to signal anyway)\n", pid, err); printErr != nil {
+					return printErr
+				}
+				continue
+			}
+			if _, printErr := fmt.Fprintf(out, "warning: could not verify PID %d (%v); proceeding because --force was set\n", pid, err); printErr != nil {
+				return printErr
+			}
+			ok = true
+		}
+		if !ok {
+			if _, printErr := fmt.Fprintf(out, "skipping live non-queuectl process PID %d (%q)\n", pid, command); printErr != nil {
+				return printErr
+			}
+			continue
+		}
+
+		if _, printErr := fmt.Fprintf(out, "stopping worker supervisor PID %d\n", pid); printErr != nil {
 			return printErr
 		}
-		ok = true
-	}
-	if !ok {
-		return fmt.Errorf("worker PID file %s points to live non-queuectl process PID %d (%q); refusing to signal it", pidPath, pid, command)
+		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+			if _, printErr := fmt.Fprintf(out, "warning: failed to signal PID %d: %v\n", pid, err); printErr != nil {
+				return printErr
+			}
+			continue
+		}
+		signaled = append(signaled, pid)
 	}
 
-	if _, err := fmt.Fprintf(out, "stopping worker supervisor PID %d\n", pid); err != nil {
-		return err
+	if !found {
+		return fmt.Errorf("no worker supervisors found in %s", pidDir)
 	}
-	if err := process.Signal(syscall.SIGTERM); err != nil {
-		return fmt.Errorf("send SIGTERM to worker supervisor PID %d: %w", pid, err)
+	if len(signaled) == 0 {
+		return fmt.Errorf("no live queuectl worker supervisors found to stop in %s", pidDir)
 	}
 
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if !isProcessAlive(pid) {
-			return nil
+	remaining := signaled
+	for time.Now().Before(deadline) && len(remaining) > 0 {
+		remaining = filterAlive(remaining)
+		if len(remaining) == 0 {
+			break
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+	remaining = filterAlive(remaining)
 
-	if _, err := fmt.Fprintf(out, "worker supervisor PID %d did not exit within %s; sending SIGKILL\n", pid, timeout); err != nil {
-		return err
-	}
-	if err := process.Signal(syscall.SIGKILL); err != nil {
-		return fmt.Errorf("send SIGKILL to worker supervisor PID %d: %w", pid, err)
+	for _, pid := range remaining {
+		if _, printErr := fmt.Fprintf(out, "worker supervisor PID %d did not exit within %s; sending SIGKILL\n", pid, timeout); printErr != nil {
+			return printErr
+		}
+		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+			if _, printErr := fmt.Fprintf(out, "warning: failed to SIGKILL PID %d: %v\n", pid, err); printErr != nil {
+				return printErr
+			}
+		}
 	}
 	return nil
 }
 
-// readPID parses the PID file at pidPath, returning os.ErrNotExist if it
-// is missing so callers can distinguish "no supervisor" from a read error.
-func readPID(pidPath string) (int, error) {
-	raw, err := os.ReadFile(pidPath)
-	if err != nil {
-		return 0, err
+func filterAlive(pids []int) []int {
+	var alive []int
+	for _, pid := range pids {
+		if isProcessAlive(pid) {
+			alive = append(alive, pid)
+		}
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil {
-		return 0, fmt.Errorf("invalid worker PID file %s: %w", pidPath, err)
+	return alive
+}
+
+// parsePIDFilename extracts the PID from a "<pid>.pid" filename as written
+// by RegisterSupervisor, ignoring anything else that might be in the
+// directory.
+func parsePIDFilename(name string) (int, bool) {
+	if !strings.HasSuffix(name, ".pid") {
+		return 0, false
 	}
-	if pid <= 0 {
-		return 0, fmt.Errorf("invalid worker PID %d in %s", pid, pidPath)
+	pid, err := strconv.Atoi(strings.TrimSuffix(name, ".pid"))
+	if err != nil || pid <= 0 {
+		return 0, false
 	}
-	return pid, nil
+	return pid, true
 }
 
 // isProcessAlive reports whether pid identifies a running process, using
 // signal 0 which the OS treats as an existence check without actually
 // signaling the process.
 func isProcessAlive(pid int) bool {
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	err = process.Signal(syscall.Signal(0))
+	err := syscall.Kill(pid, syscall.Signal(0))
 	return err == nil
 }
 
@@ -199,8 +219,8 @@ func isQueueCTLSupervisor(pid int) (bool, string, error) {
 // processCommand returns pid's full command line, read from /proc on Linux
 // or via `ps` elsewhere (e.g. macOS, which has no /proc). In sandboxed
 // environments where both are unavailable, this returns an error rather
-// than guessing; see StopSupervisor's force parameter for how callers can
-// choose to proceed anyway.
+// than guessing; see StopAllSupervisors' force parameter for how callers
+// can choose to proceed anyway.
 func processCommand(pid int) (string, error) {
 	if raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil && len(raw) > 0 {
 		command := strings.ReplaceAll(strings.Trim(string(raw), "\x00"), "\x00", " ")
@@ -219,3 +239,4 @@ func processCommand(pid int) (string, error) {
 	}
 	return command, nil
 }
+

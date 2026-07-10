@@ -13,8 +13,6 @@ import (
 )
 
 const (
-	reaperInterval = 30 * time.Second
-
 	// staleWorkerRowTTL is how old a worker row's last_heartbeat must be
 	// before the reaper garbage-collects it. This is deliberately much
 	// larger than worker-stale-seconds (which only controls whether
@@ -112,11 +110,11 @@ func killProcessGroup(pgid int) error {
 	return nil
 }
 
-// RunReaperLoop calls RunReaperOnce every reaperInterval until ctx is
-// canceled. It is meant to run in its own goroutine alongside a worker
-// pool, in addition to the single startup call in Pool.Start.
+// RunReaperLoop calls RunReaperOnce every appconfig.ReaperInterval until
+// ctx is canceled. It is meant to run in its own goroutine alongside a
+// worker pool, in addition to the single startup call in Pool.Start.
 func RunReaperLoop(ctx context.Context, store *storage.Store, logger *slog.Logger) {
-	ticker := time.NewTicker(reaperInterval)
+	ticker := time.NewTicker(appconfig.ReaperInterval)
 	defer ticker.Stop()
 
 	for {

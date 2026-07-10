@@ -48,7 +48,7 @@ func newWorkerStartCommand(dbPathFlag *string) *cobra.Command {
 			defer stop()
 
 			logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-			pool := workerpkg.NewPool(store, count, appconfig.WorkerPIDPath(dbPath), logger)
+			pool := workerpkg.NewPool(store, count, appconfig.WorkerPIDDir(dbPath), logger)
 			return pool.Start(signalCtx)
 		},
 	}
@@ -60,7 +60,7 @@ func newWorkerStopCommand(dbPathFlag *string) *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
 		Use:   "stop",
-		Short: "Gracefully stop the worker supervisor",
+		Short: "Gracefully stop all running worker supervisors",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 			dbPath := resolvedDBPath(dbPathFlag)
@@ -74,7 +74,7 @@ func newWorkerStopCommand(dbPathFlag *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return workerpkg.StopSupervisor(appconfig.WorkerPIDPath(dbPath), time.Duration(timeoutSeconds)*time.Second, cmd.OutOrStdout(), force)
+			return workerpkg.StopAllSupervisors(appconfig.WorkerPIDDir(dbPath), time.Duration(timeoutSeconds)*time.Second, cmd.OutOrStdout(), force)
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "skip process verification if it cannot be performed (e.g. sandboxed environments where ps is blocked) and signal the PID anyway")

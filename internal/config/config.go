@@ -12,7 +12,12 @@ import (
 
 const (
 	DefaultDBPath = ".queuectl/queuectl.db"
-	PIDFilePath   = ".queuectl/worker.pid"
+
+	// PIDDirName is the subdirectory (under .queuectl) that holds one PID
+	// file per running "queuectl worker start" process, letting multiple
+	// supervisors run concurrently against the same database (see
+	// WorkerPIDDir). Each file is named after its own process's PID.
+	PIDDirName = "workers"
 
 	KeyMaxRetries         = "max-retries"
 	KeyBackoffBase        = "backoff-base"
@@ -26,6 +31,17 @@ const (
 	// directly rather than defining its own, so it can't drift out of sync
 	// with the worker-stale-seconds minimum derived from it below).
 	HeartbeatInterval = 5 * time.Second
+
+	// ReaperInterval is how often the crash-recovery reaper sweeps for
+	// stale processing jobs (internal/worker.RunReaperLoop uses this
+	// constant directly). Combined with the default lock-timeout-seconds
+	// below, this sets the worst-case crash-recovery delay: a job can sit
+	// stale for up to lock-timeout-seconds before the reaper even
+	// considers it, plus up to one more ReaperInterval before the next
+	// sweep actually runs. With the defaults below (20s + 10s = 30s) that
+	// stays comfortably under the assignment's 60-second requirement, with
+	// margin for scheduling jitter on a loaded machine. See DECISIONS.md.
+	ReaperInterval = 10 * time.Second
 )
 
 // minWorkerStaleSeconds requires worker-stale-seconds to cover at least two
@@ -41,7 +57,7 @@ var Defaults = map[string]int{
 	KeyMaxRetries:         3,
 	KeyBackoffBase:        2,
 	KeyPollIntervalMS:     500,
-	KeyLockTimeoutSeconds: 120,
+	KeyLockTimeoutSeconds: 20,
 	KeyWorkerStaleSeconds: 15,
 	KeyStopTimeoutSeconds: 30,
 }
@@ -68,29 +84,27 @@ func EnsureParentDir(path string) error {
 	return os.MkdirAll(dir, 0o755)
 }
 
-// EnsureQueueDir creates the .queuectl directory used for the default
-// database and worker PID files.
-func EnsureQueueDir() error {
-	return os.MkdirAll(".queuectl", 0o755)
-}
-
-// WorkerPIDPath derives the PID file path for a given database path: the
-// well-known PIDFilePath for the default database, or a path derived from
-// a hash of dbPath's absolute form otherwise. This lets multiple worker
-// supervisors run concurrently against different --db targets without
-// colliding on one PID file.
-func WorkerPIDPath(dbPath string) string {
+// WorkerPIDDir derives the PID directory for a given database path: the
+// well-known ".queuectl/workers" directory for the default database, or a
+// directory derived from a hash of dbPath's absolute form otherwise. This
+// lets multiple worker supervisors run concurrently against different --db
+// targets without colliding on one another's PID files, while every
+// supervisor sharing a database path registers into the same directory (see
+// worker.RegisterSupervisor / worker.StopAllSupervisors) so any number of
+// "queuectl worker start" processes - including ones started from separate
+// terminals - can coexist and all be discovered by "queuectl worker stop".
+func WorkerPIDDir(dbPath string) string {
 	absDB, err := filepath.Abs(dbPath)
 	if err != nil {
 		absDB = dbPath
 	}
 	absDefault, err := filepath.Abs(DefaultDBPath)
 	if err == nil && absDB == absDefault {
-		return PIDFilePath
+		return filepath.Join(".queuectl", PIDDirName)
 	}
 
 	sum := sha256.Sum256([]byte(absDB))
-	return filepath.Join(".queuectl", "worker-"+hex.EncodeToString(sum[:6])+".pid")
+	return filepath.Join(".queuectl", PIDDirName+"-"+hex.EncodeToString(sum[:6]))
 }
 
 // ValidateConfigValue parses raw as an integer and checks it against the

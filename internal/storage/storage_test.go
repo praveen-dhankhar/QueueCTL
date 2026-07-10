@@ -231,7 +231,7 @@ func TestWorkerConcurrencyCompletesJobsOnce(t *testing.T) {
 	poolCtx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	pool := worker.NewPool(store, 5, appconfig.WorkerPIDPath(dbPath), logger)
+	pool := worker.NewPool(store, 5, appconfig.WorkerPIDDir(dbPath), logger)
 	go func() {
 		errCh <- pool.Start(poolCtx)
 	}()
@@ -273,7 +273,7 @@ func TestLeaseRenewalPreventsStaleRecoveryDuringLongJob(t *testing.T) {
 	poolCtx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	pool := worker.NewPool(store, 1, appconfig.WorkerPIDPath(dbPath), logger)
+	pool := worker.NewPool(store, 1, appconfig.WorkerPIDDir(dbPath), logger)
 	go func() {
 		errCh <- pool.Start(poolCtx)
 	}()
