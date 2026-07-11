@@ -41,6 +41,8 @@ This isn't a Go-level mutex, so it holds regardless of whether the two callers a
 
 Earlier defaults (`lock-timeout-seconds=120`, reaper every 30s) gave a worst case of ~150s — well outside the requirement. This was a real bug, not a stylistic choice; the numbers above are the fix.
 
+**A known, narrow edge case in the above**: `locked_pgid` isn't set atomically with the claim — it's only recorded once `sh -c` actually starts (`SetJobLockPGID`, called from `ExecuteCommand`'s `onStart`), which is a moment after `ClaimNextJob` sets `locked_at`. If a worker goroutine were stalled between those two points for longer than `lock-timeout-seconds` (e.g. a multi-second GC pause or scheduler starvation — not something that happens in ordinary operation, but not physically impossible either), the reaper could reclaim the job with no `locked_pgid` to kill. The DB row would be safely recovered (the fencing still holds), but the original process, once it did start, would run to completion unsupervised and untracked, potentially alongside a fresh claim of the same job. This is a gap in the process-group cleanup story specifically, not in claim atomicity — the row itself is never claimed twice.
+
 ## 3. Does `dlq retry` reset `attempts`? Why is that the right call?
 
 Yes — `RetryDeadJob` (`internal/storage/reaper.go`) sets `attempts = 0` when moving a job from `dead` back to `pending`, while preserving the original `id`, `command`, and `max_retries`.

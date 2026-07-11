@@ -171,7 +171,9 @@ Everything here is stored in SQLite and changed with `queuectl config set <key> 
 | `worker-stale-seconds` | `15` | `>= 10` | How recent a worker's heartbeat needs to be for `status` to count it as active. The minimum is tied to the worker heartbeat cadence (every 5s): anything lower and a perfectly healthy worker would periodically show as inactive in the gap between two ordinary heartbeats. |
 | `stop-timeout-seconds` | `30` | `>= 1` | How long `worker stop` waits for a graceful shutdown before escalating to SIGKILL. |
 
-Note that `max_retries` set in the enqueue JSON only affects that one job — it doesn't touch the `max-retries` config, and existing jobs don't retroactively pick up a config change either. Each job keeps whatever `max_retries` it was created with.
+Note that `max_retries` set in the enqueue JSON only affects that one job — it doesn't touch the `max-retries` config, and existing jobs don't retroactively pick up a config change either. Each job keeps whatever `max_retries` it was created with, since it's stored on the job row at enqueue time.
+
+`backoff-base` behaves differently: it is *not* stored per job, so it's read fresh from config every time a retry delay is computed. Changing it with `config set backoff-base <n>` immediately changes the delay calculation for every job's *next* failure — including jobs that were already enqueued, already failed once and waiting on `next_retry_at`, or mid-execution when the change happens — not just jobs enqueued afterward. The same applies to `poll-interval-ms`, `lock-timeout-seconds`, `worker-stale-seconds`, and `stop-timeout-seconds`: all of them are read from config at the point of use rather than captured once, so `max-retries` (baked into the job row) is the one exception, not the rule.
 
 ## Testing
 
