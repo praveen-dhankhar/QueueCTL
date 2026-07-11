@@ -44,6 +44,19 @@ func TestJobFailureTransitions(t *testing.T) {
 	require.Nil(t, j.NextRetryAt)
 }
 
+// TestNextAttemptState guards the single source of truth for the
+// retry-vs-dead decision that Job.MarkFailedOrDead, worker.Pool.executeJob,
+// and worker.RunReaperOnce all defer to, so the three failure paths
+// (normal execution, panic recovery, and reaper recovery) can't drift out
+// of sync with each other.
+func TestNextAttemptState(t *testing.T) {
+	require.Equal(t, StateFailed, NextAttemptState(1, 3), "attempts below max_retries should retry")
+	require.Equal(t, StateFailed, NextAttemptState(2, 3), "attempts still below max_retries should retry")
+	require.Equal(t, StateDead, NextAttemptState(3, 3), "attempts reaching max_retries should be dead")
+	require.Equal(t, StateDead, NextAttemptState(4, 3), "attempts exceeding max_retries should be dead")
+	require.Equal(t, StateDead, NextAttemptState(1, 1), "a single-attempt job dies on its first failure")
+}
+
 func TestRetryFromDLQ(t *testing.T) {
 	now := time.Now().UTC()
 	j, err := New("job1", "false", 1, now)

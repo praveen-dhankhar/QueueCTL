@@ -53,10 +53,9 @@ func RunReaperOnce(ctx context.Context, store *storage.Store, logger *slog.Logge
 	recovered := 0
 	for _, stale := range staleJobs {
 		attempts := stale.Attempts + 1
-		nextState := job.StateDead
+		nextState := job.NextAttemptState(attempts, stale.MaxRetries)
 		var nextRetryAt *time.Time
-		if attempts < stale.MaxRetries {
-			nextState = job.StateFailed
+		if nextState == job.StateFailed {
 			retryAt := time.Now().UTC().Add(BackoffDelay(backoffBase, attempts))
 			nextRetryAt = &retryAt
 		}

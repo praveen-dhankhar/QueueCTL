@@ -205,10 +205,9 @@ func (p *Pool) executeJob(workerID string, claimed job.Job) {
 	}
 
 	attempts := claimed.Attempts + 1
-	nextState := job.StateDead
+	nextState := job.NextAttemptState(attempts, claimed.MaxRetries)
 	var nextRetryAt *time.Time
-	if attempts < claimed.MaxRetries {
-		nextState = job.StateFailed
+	if nextState == job.StateFailed {
 		retryAt := time.Now().UTC().Add(BackoffDelay(backoffBase, attempts))
 		nextRetryAt = &retryAt
 	}

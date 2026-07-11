@@ -137,6 +137,22 @@ func (j *Job) MarkCompleted(now time.Time) error {
 	return nil
 }
 
+// NextAttemptState decides the state a job moves to after a failed
+// attempt: failed, if attempts remain below maxRetries, or dead once
+// exhausted. attempts is the total attempt count including the one that
+// just failed. This is the single source of truth for that decision -
+// Job.MarkFailedOrDead, worker.Pool.executeJob, and worker.RunReaperOnce
+// all call it rather than each re-implementing the < comparison, so the
+// retry-exhaustion rule can't drift out of sync between the three places a
+// job can be failed (normal execution, panic recovery, and reaper
+// recovery).
+func NextAttemptState(attempts int, maxRetries int) State {
+	if attempts < maxRetries {
+		return StateFailed
+	}
+	return StateDead
+}
+
 // MarkFailedOrDead transitions a processing job to failed (with
 // nextRetryAt set, if attempts remain below MaxRetries) or dead (once
 // exhausted), clearing its lock either way. It errors if the job is not
@@ -146,11 +162,10 @@ func (j *Job) MarkFailedOrDead(nextRetryAt *time.Time, now time.Time) error {
 		return fmt.Errorf("cannot fail job in state %q", j.State)
 	}
 	j.Attempts++
-	if j.Attempts < j.MaxRetries {
-		j.State = StateFailed
+	j.State = NextAttemptState(j.Attempts, j.MaxRetries)
+	if j.State == StateFailed {
 		j.NextRetryAt = nextRetryAt
 	} else {
-		j.State = StateDead
 		j.NextRetryAt = nil
 	}
 	j.LockedBy = nil
