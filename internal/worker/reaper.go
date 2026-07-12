@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"syscall"
 	"time"
@@ -24,23 +25,33 @@ const (
 	staleWorkerRowTTL = 1 * time.Hour
 )
 
+// interruptedRunNote is the stderr body recorded in job_runs for an attempt
+// that was cut short by its worker dying rather than by the command itself
+// exiting, so "queuectl logs" shows the interrupted attempt instead of
+// silently skipping from one complete attempt to the next.
+const interruptedRunNote = "queuectl: attempt interrupted - the worker holding this job stopped renewing its lease (killed, crashed, or wedged) and the job was requeued by the reaper"
+
 // RunReaperOnce recovers processing jobs whose lock has gone stale
-// (locked_at older than the configured lock-timeout-seconds), moving each
-// either back to failed with a backoff or to dead if retries are
-// exhausted, and also garbage-collects worker rows abandoned by a
-// non-graceful exit (see staleWorkerRowTTL). logger may be nil to suppress
-// per-job warnings. It returns the number of jobs actually recovered, which
-// can be less than the number found stale if a worker's lease renewal or
-// completion raced with the reaper (see RecoverStaleJob's lock fencing).
-// A failure to purge stale worker rows is logged but does not fail the
-// call or affect the returned count, since job recovery is this function's
-// primary responsibility and worker-row cleanup is best-effort.
+// (locked_at older than the configured lock-timeout-seconds), returning each
+// to pending to be claimed and run again, and also garbage-collects worker
+// rows abandoned by a non-graceful exit (see staleWorkerRowTTL). logger may
+// be nil to suppress per-job warnings. It returns the number of jobs actually
+// recovered, which can be less than the number found stale if a worker's
+// lease renewal or completion raced with the reaper (see RecoverStaleJob's
+// lock fencing). A failure to purge stale worker rows is logged but does not
+// fail the call or affect the returned count, since job recovery is this
+// function's primary responsibility and worker-row cleanup is best-effort.
+//
+// Every stale job is attempted even if an earlier one fails; the returned
+// error joins whatever went wrong, and the returned count still reports the
+// jobs that were recovered alongside it. A non-nil error therefore does not
+// mean nothing was recovered.
+//
+// A recovered job keeps its attempts count: a dead worker is not a failed
+// command, so the interrupted attempt is recorded in job_runs but not
+// charged against the job's retry budget. See storage.RecoverStaleJob.
 func RunReaperOnce(ctx context.Context, store *storage.Store, logger *slog.Logger) (int, error) {
 	lockTimeout, err := store.GetConfigInt(ctx, appconfig.KeyLockTimeoutSeconds)
-	if err != nil {
-		return 0, err
-	}
-	backoffBase, err := store.GetConfigInt(ctx, appconfig.KeyBackoffBase)
 	if err != nil {
 		return 0, err
 	}
@@ -50,23 +61,36 @@ func RunReaperOnce(ctx context.Context, store *storage.Store, logger *slog.Logge
 		return 0, err
 	}
 
+	// A job that fails to recover must not stop the sweep. ListStaleProcessingJobs
+	// orders by locked_at ASC, so the same row leads every pass: aborting on it
+	// would park every *other* stale job behind one poison row, on this pass and
+	// on all of them, and crash recovery is the one thing that has to keep
+	// working when things are already going wrong. Errors are collected and
+	// returned together once every job has had its turn.
 	recovered := 0
+	var errs []error
 	for _, stale := range staleJobs {
-		attempts := stale.Attempts + 1
-		nextState := job.NextAttemptState(attempts, stale.MaxRetries)
-		var nextRetryAt *time.Time
-		if nextState == job.StateFailed {
-			retryAt := time.Now().UTC().Add(BackoffDelay(backoffBase, attempts))
-			nextRetryAt = &retryAt
+		run := storage.JobRun{
+			Stderr:     interruptedRunNote,
+			StartedAt:  staleRunStartedAt(stale),
+			FinishedAt: time.Now().UTC(),
 		}
-		ok, err := store.RecoverStaleJob(ctx, stale, attempts, nextState, nextRetryAt)
+		if stale.LockedBy != nil {
+			run.WorkerID = *stale.LockedBy
+		}
+		ok, err := store.RecoverStaleJob(ctx, stale, run)
 		if err != nil {
-			return recovered, err
+			errs = append(errs, fmt.Errorf("recover stale job %s: %w", stale.ID, err))
+			if logger != nil {
+				logger.Error("failed to recover stale job; continuing the sweep", "job_id", stale.ID, "error", err)
+			}
+			continue
 		}
 		if ok {
 			recovered++
 			if logger != nil {
-				logger.Warn("recovered stale processing job", "job_id", stale.ID, "state", nextState, "attempts", attempts)
+				logger.Warn("recovered stale processing job; requeued as pending without charging an attempt",
+					"job_id", stale.ID, "attempts", stale.Attempts)
 			}
 			// The job's lock is fenced away from whatever worker held it,
 			// but the "sh -c" command it started may still be running (the
@@ -91,7 +115,22 @@ func RunReaperOnce(ctx context.Context, store *storage.Store, logger *slog.Logge
 		logger.Warn("purged worker rows abandoned without a graceful shutdown", "count", purged)
 	}
 
-	return recovered, nil
+	return recovered, errors.Join(errs...)
+}
+
+// staleRunStartedAt is the best available start time for an interrupted
+// attempt. The jobs row does not persist when the command actually started -
+// only locked_at, which the worker overwrites on every lease renewal - so
+// this is the last moment the dead worker was known to still hold the job,
+// not the true start. It is an approximation, recorded so the job_runs row
+// for the interrupted attempt has a timestamp at all (started_at is NOT
+// NULL); a job_runs row with no exit code is what marks the attempt as
+// interrupted, not this value.
+func staleRunStartedAt(stale job.Job) time.Time {
+	if stale.LockedAt != nil {
+		return *stale.LockedAt
+	}
+	return stale.UpdatedAt
 }
 
 // killProcessGroup sends SIGKILL to every process in the group led by

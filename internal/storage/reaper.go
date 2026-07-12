@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -13,7 +15,7 @@ import (
 // because their worker likely crashed or stopped renewing its lease.
 func (s *Store) ListStaleProcessingJobs(ctx context.Context, lockTimeoutSeconds int) ([]job.Job, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, locked_pgid, created_at, updated_at
+SELECT `+jobColumns+`
 FROM jobs
 WHERE state = 'processing'
 AND locked_at < datetime('now', '-' || ? || ' seconds')
@@ -25,43 +27,87 @@ ORDER BY locked_at ASC;`, lockTimeoutSeconds)
 	return scanJobs(rows)
 }
 
-// RecoverStaleJob moves a stale processing job to state (failed or dead),
+// errRecoveryFenceLost is an internal sentinel used to roll back
+// RecoverStaleJob's transaction when the lock fence doesn't match, so the
+// job_runs row it would have written for the interrupted attempt is not
+// persisted for a job it turned out not to have recovered.
+var errRecoveryFenceLost = errors.New("recovery fence lost")
+
+// RecoverStaleJob returns a stale processing job to pending and records the
+// interrupted attempt in job_runs, in one BEGIN IMMEDIATE transaction. It is
 // fenced on the job still being processing and locked by j's own
-// locked_by/locked_at. The fence means a worker that renewed its lease (or
-// already completed the job) between ListStaleProcessingJobs and this call
-// wins the race: the update affects zero rows and the second return value
-// is false. Callers must not assume recovery happened just because the job
-// looked stale a moment earlier.
-func (s *Store) RecoverStaleJob(ctx context.Context, j job.Job, attempts int, state job.State, nextRetryAt *time.Time) (bool, error) {
+// locked_by/locked_at: a worker that renewed its lease (or already completed
+// the job) between ListStaleProcessingJobs and this call wins the race, the
+// update affects zero rows, and the second return value is false with no
+// job_runs row written. Callers must not assume recovery happened just
+// because the job looked stale a moment earlier.
+//
+// attempts is deliberately left unchanged. A stale lock means the worker
+// died mid-run (SIGKILL, crash, wedge) - it says nothing about whether the
+// job's own command would have succeeded, so charging the job a retry for it
+// would let an operator-side event exhaust a job's retry budget. With
+// max_retries = 1 that is fatal: the very first SIGKILL of a worker would
+// send an otherwise healthy job straight to dead instead of running it
+// again, which is exactly the crash-recovery guarantee this queue is
+// supposed to make. next_retry_at is cleared for the same reason: the job
+// isn't being punished for a failure, so it becomes claimable immediately
+// rather than after a backoff.
+//
+// ponytail: an interrupted attempt is now completely uncounted, so a job
+// whose command somehow kills its own worker every time (an OOM big enough
+// to take the supervisor with it, say) would be retried forever. Bounding
+// that needs a separate counter - an `interrupts` column with its own cap -
+// rather than overloading `attempts`, which is the field that means "times
+// this command actually ran and failed".
+func (s *Store) RecoverStaleJob(ctx context.Context, j job.Job, run JobRun) (bool, error) {
+	run.JobID = j.ID
+	run.Attempt = j.Attempts + 1
 	lockedBy, lockedAt, err := jobLockFence(j)
 	if err != nil {
 		return false, err
 	}
-	result, err := s.db.ExecContext(ctx, `
+
+	err = s.withImmediateTx(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		result, err := conn.ExecContext(ctx, `
 UPDATE jobs
-SET attempts = ?, state = ?, next_retry_at = ?, locked_by = NULL, locked_at = NULL, locked_pgid = NULL, updated_at = ?
+SET state = 'pending', next_retry_at = NULL, locked_by = NULL, locked_at = NULL, locked_pgid = NULL, updated_at = ?
 WHERE id = ? AND state = 'processing' AND locked_by = ? AND locked_at = ?;`,
-		attempts,
-		string(state),
-		nullableTime(nextRetryAt),
-		formatTime(time.Now()),
-		j.ID,
-		lockedBy,
-		lockedAt,
-	)
-	if err != nil {
-		return false, fmt.Errorf("recover stale job %s: %w", j.ID, err)
+			formatTime(time.Now()),
+			j.ID,
+			lockedBy,
+			lockedAt,
+		)
+		if err != nil {
+			return fmt.Errorf("recover stale job %s: %w", j.ID, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("recover stale job rows affected: %w", err)
+		}
+		if rows == 0 {
+			return errRecoveryFenceLost
+		}
+		return insertJobRun(ctx, conn, run)
+	})
+	if errors.Is(err, errRecoveryFenceLost) {
+		return false, nil
 	}
-	rows, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("recover stale job rows affected: %w", err)
+		return false, err
 	}
-	return rows > 0, nil
+	return true, nil
 }
 
 // RetryDeadJob moves a dead job back to pending with attempts and locks
 // reset, fenced on state = 'dead' so retrying a job that isn't currently
 // dead returns an error instead of silently reviving it.
+//
+// locked_pgid is cleared along with the rest of the lock. It is always already
+// NULL on a dead job today (the only path into dead, RecordJobFailure, nulls
+// it), but a stale pgid surviving on a claimable row is not a bug worth being
+// one refactor away from: the reaper SIGKILLs whatever process group
+// locked_pgid names, and a PID the OS has since recycled names somebody else's
+// processes.
 func (s *Store) RetryDeadJob(ctx context.Context, id string) error {
 	result, err := s.db.ExecContext(ctx, `
 UPDATE jobs
@@ -70,6 +116,7 @@ attempts = 0,
 next_retry_at = NULL,
 locked_by = NULL,
 locked_at = NULL,
+locked_pgid = NULL,
 updated_at = ?
 WHERE id = ? AND state = 'dead';`, formatTime(time.Now()), id)
 	if err != nil {
