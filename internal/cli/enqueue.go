@@ -16,9 +16,10 @@ import (
 )
 
 type enqueueInput struct {
-	ID         string `json:"id"`
-	Command    string `json:"command"`
-	MaxRetries *int   `json:"max_retries"`
+	ID             string `json:"id"`
+	Command        string `json:"command"`
+	MaxRetries     *int   `json:"max_retries"`
+	TimeoutSeconds *int   `json:"timeout_seconds"`
 }
 
 func newEnqueueCommand(dbPathFlag *string) *cobra.Command {
@@ -63,10 +64,27 @@ func newEnqueueCommand(dbPathFlag *string) *cobra.Command {
 				}
 			}
 
+			// Zero is a legitimate value here (run with no timeout), so an
+			// explicit "timeout_seconds": 0 is honored rather than falling
+			// back to the config default. Only an absent field falls back.
+			timeoutSeconds := 0
+			if input.TimeoutSeconds != nil {
+				if *input.TimeoutSeconds < 0 {
+					return fmt.Errorf("timeout_seconds must be >= 0")
+				}
+				timeoutSeconds = *input.TimeoutSeconds
+			} else {
+				timeoutSeconds, err = store.GetConfigInt(ctx, appconfig.KeyJobTimeoutSeconds)
+				if err != nil {
+					return err
+				}
+			}
+
 			j, err := job.New(id, input.Command, maxRetries, time.Now())
 			if err != nil {
 				return err
 			}
+			j.TimeoutSeconds = timeoutSeconds
 			if err := store.InsertJob(ctx, j); err != nil {
 				if strings.Contains(strings.ToLower(err.Error()), "constraint") {
 					return fmt.Errorf("job id %q already exists", id)

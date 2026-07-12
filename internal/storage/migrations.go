@@ -55,6 +55,7 @@ command TEXT NOT NULL,
 state TEXT NOT NULL CHECK (state IN ('pending', 'processing', 'completed', 'failed', 'dead')),
 attempts INTEGER NOT NULL DEFAULT 0,
 max_retries INTEGER NOT NULL,
+timeout_seconds INTEGER NOT NULL DEFAULT 0,
 next_retry_at DATETIME,
 locked_by TEXT,
 locked_at DATETIME,
@@ -97,10 +98,15 @@ FOREIGN KEY (job_id) REFERENCES jobs(id)
 		}
 	}
 
-	// jobs.locked_pgid was added after the initial schema; CREATE TABLE IF
-	// NOT EXISTS above is a no-op against a database created before this
-	// column existed, so it needs an explicit additive migration.
+	// jobs.locked_pgid and jobs.timeout_seconds were both added after the
+	// initial schema; CREATE TABLE IF NOT EXISTS above is a no-op against a
+	// database created before these columns existed, so each needs an explicit
+	// additive migration. timeout_seconds defaults to 0 (no timeout), so jobs
+	// already queued in an older database keep their existing behavior.
 	if err := ensureColumn(ctx, conn, "jobs", "locked_pgid", "INTEGER"); err != nil {
+		return err
+	}
+	if err := ensureColumn(ctx, conn, "jobs", "timeout_seconds", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 

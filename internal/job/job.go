@@ -44,9 +44,15 @@ type Job struct {
 	State       State
 	Attempts    int
 	MaxRetries  int
-	NextRetryAt *time.Time
-	LockedBy    *string
-	LockedAt    *time.Time
+	// TimeoutSeconds bounds how long this job's command may run before the
+	// worker kills it. Zero means no timeout. A timed-out attempt is charged
+	// against the retry budget like any other failure: unlike a dead worker
+	// (see storage.RecoverStaleJob), a command that ran past its own deadline
+	// is the job failing, not the queue failing it.
+	TimeoutSeconds int
+	NextRetryAt    *time.Time
+	LockedBy       *string
+	LockedAt       *time.Time
 	// LockedPGID is the OS process-group ID leading the job's running "sh
 	// -c" command, recorded once the worker starts it. It lets the reaper
 	// kill the whole group (not just record the job as recovered) when it

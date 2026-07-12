@@ -26,6 +26,14 @@ const (
 	KeyWorkerStaleSeconds = "worker-stale-seconds"
 	KeyStopTimeoutSeconds = "stop-timeout-seconds"
 
+	// KeyJobTimeoutSeconds is the default wall-clock limit applied to a job
+	// whose enqueue JSON does not carry its own "timeout_seconds". Zero - the
+	// default - means no timeout, so an existing queue behaves exactly as it
+	// did before this key existed. Like max-retries, it is read once at
+	// enqueue time and baked into the job row, so changing it does not
+	// retroactively bound jobs that are already queued.
+	KeyJobTimeoutSeconds = "job-timeout-seconds"
+
 	// HeartbeatInterval is how often a running worker refreshes its
 	// workers.last_heartbeat row (internal/worker.Pool uses this constant
 	// directly rather than defining its own, so it can't drift out of sync
@@ -60,6 +68,7 @@ var Defaults = map[string]int{
 	KeyLockTimeoutSeconds: 20,
 	KeyWorkerStaleSeconds: 15,
 	KeyStopTimeoutSeconds: 30,
+	KeyJobTimeoutSeconds:  0,
 }
 
 // ResolveDBPath picks the database path with precedence --db flag >
@@ -86,25 +95,35 @@ func EnsureParentDir(path string) error {
 
 // WorkerPIDDir derives the PID directory for a given database path: the
 // well-known ".queuectl/workers" directory for the default database, or a
-// directory derived from a hash of dbPath's absolute form otherwise. This
-// lets multiple worker supervisors run concurrently against different --db
-// targets without colliding on one another's PID files, while every
-// supervisor sharing a database path registers into the same directory (see
-// worker.RegisterSupervisor / worker.StopAllSupervisors) so any number of
-// "queuectl worker start" processes - including ones started from separate
+// sibling of the database file derived from a hash of its absolute path
+// otherwise. This lets multiple worker supervisors run concurrently against
+// different --db targets without colliding on one another's PID files, while
+// every supervisor sharing a database path registers into the same directory
+// (see worker.RegisterSupervisor / worker.StopAllSupervisors) so any number
+// of "queuectl worker start" processes - including ones started from separate
 // terminals - can coexist and all be discovered by "queuectl worker stop".
+//
+// The returned path is anchored to the database file's own directory, not to
+// the process's working directory. That matters because "worker start" and
+// "worker stop" are separate invocations that need not share a working
+// directory: with a CWD-relative PID directory, "queuectl worker stop --db
+// /abs/path/queue.db" run from anywhere other than where the supervisor was
+// started would look in an empty (or wrong) directory and report no workers
+// to stop, even though the same --db target was named in both commands.
 func WorkerPIDDir(dbPath string) string {
 	absDB, err := filepath.Abs(dbPath)
 	if err != nil {
 		absDB = dbPath
 	}
+	dbDir := filepath.Dir(absDB)
+
 	absDefault, err := filepath.Abs(DefaultDBPath)
 	if err == nil && absDB == absDefault {
-		return filepath.Join(".queuectl", PIDDirName)
+		return filepath.Join(dbDir, PIDDirName)
 	}
 
 	sum := sha256.Sum256([]byte(absDB))
-	return filepath.Join(".queuectl", PIDDirName+"-"+hex.EncodeToString(sum[:6]))
+	return filepath.Join(dbDir, PIDDirName+"-"+hex.EncodeToString(sum[:6]))
 }
 
 // ValidateConfigValue parses raw as an integer and checks it against the
@@ -116,6 +135,8 @@ func ValidateConfigValue(key string, raw string) (int, error) {
 		return 0, fmt.Errorf("%s must be an integer", key)
 	}
 
+	// job-timeout-seconds is the one key whose minimum is 0, because 0 is a
+	// meaningful value for it (no timeout) rather than a misconfiguration.
 	minimum, ok := map[string]int{
 		KeyMaxRetries:         1,
 		KeyBackoffBase:        1,
@@ -123,6 +144,7 @@ func ValidateConfigValue(key string, raw string) (int, error) {
 		KeyLockTimeoutSeconds: 1,
 		KeyWorkerStaleSeconds: minWorkerStaleSeconds,
 		KeyStopTimeoutSeconds: 1,
+		KeyJobTimeoutSeconds:  0,
 	}[key]
 	if !ok {
 		return 0, fmt.Errorf("unknown config key %q", key)
