@@ -45,7 +45,11 @@ func newLogsCommand(dbPathFlag *string) *cobra.Command {
 				if i > 0 {
 					fmt.Fprintln(out)
 				}
-				exitCode := "n/a"
+				// A run with no exit code never got to report one: its worker
+				// died mid-command and the reaper requeued the job (see
+				// worker.RunReaperOnce). Say so, rather than printing an
+				// exit_code of "n/a" that reads like a missing field.
+				exitCode := "interrupted (worker died; job requeued)"
 				if run.ExitCode != nil {
 					exitCode = fmt.Sprintf("%d", *run.ExitCode)
 				}

@@ -38,13 +38,21 @@ Enqueue a job. If you don't give it an `id`, one gets generated for you:
 ./queuectl enqueue '{"id":"job1","command":"echo hello"}'
 ```
 
+Give a job a wall-clock limit with `timeout_seconds` — if the command outruns it, its whole process group is killed and the attempt is charged as a failure, so it backs off and retries like any other:
+
+```bash
+./queuectl enqueue '{"id":"job2","command":"curl -s slow.example.com","timeout_seconds":30}'
+```
+
+Leave it out and the job inherits the `job-timeout-seconds` config default (`0`, meaning no timeout). Pass an explicit `"timeout_seconds": 0` to opt one job out of that default and let it run as long as it needs.
+
 Start a few workers. This runs in the foreground and blocks, so you'll want a separate terminal (or run it with `&`, or under something like `tmux`/`nohup`):
 
 ```bash
 ./queuectl worker start --count 3
 ```
 
-You can run `worker start` more than once against the same database — from as many separate terminals as you like. Each invocation is its own OS process with its own goroutine pool; they all claim from the same queue and never duplicate work (see [Concurrency](#concurrency)):
+You can run `worker start` more than once against the same database — from as many separate terminals as you like. Each invocation is its own OS process with its own goroutine pool; they all claim from the same queue, and no job is ever claimed by two workers at once (see [Concurrency](#concurrency)):
 
 ```bash
 # terminal 2, same database
@@ -109,6 +117,46 @@ Every execution attempt (stdout, stderr, exit code) is recorded, whether it succ
 ./queuectl logs job1
 ```
 
+An attempt whose worker was killed mid-command shows up here too, as an attempt with no exit code:
+
+```text
+attempt 1  worker=host:61530:1  exit_code=interrupted (worker died; job requeued)  started=...  finished=...
+```
+
+A crash isn't the job's own failure, so an interrupted attempt is recorded but *not* charged against the job's retry budget — it goes back to `pending` with its attempts untouched and runs again. See [DECISIONS.md](DECISIONS.md) question 2.
+
+Each stream is captured up to 64KiB. Job commands are arbitrary shell, so their output is arbitrary in size — an uncapped buffer means a command that prints in a loop grows the worker's memory until the OS kills it, taking every other in-flight job on that worker with it. Anything past the cap is dropped, visibly:
+
+```text
+[queuectl: output truncated at 65536 bytes; 1934469 further bytes dropped]
+```
+
+Aggregate stats across every recorded attempt (`--json` works here too):
+
+```bash
+./queuectl metrics
+```
+
+```text
+Runs:
+total: 2
+succeeded: 1
+failed: 0
+interrupted: 1
+success rate: 100.0%
+
+Duration (seconds, completed attempts only):
+avg: 6.00
+p95: 6.00
+max: 6.00
+
+Throughput (jobs completed):
+last 1m: 1
+last 5m: 1
+```
+
+Interrupted attempts are excluded from the success rate and the durations: a command cut short by a SIGKILL says nothing about how long it takes or whether it works, so averaging its truncated duration in would just skew the numbers.
+
 Tune the defaults (see the [Configuration](#configuration) table below for what each key does):
 
 ```bash
@@ -158,6 +206,18 @@ Job commands run as the leader of their own OS process group (not queuectl's own
 
 Each `worker start` process registers its own PID file (named after its own PID) in a shared directory under `.queuectl/`, rather than one process claiming a single exclusive PID file. `worker stop` scans that directory, verifies each live PID is actually a `queuectl worker start` process, and signals every one it finds — so it can stop any number of supervisors from a single invocation, from a different terminal than any of them.
 
+### Delivery guarantee: at-least-once
+
+Worth being precise about, because it's the one guarantee people assume is stronger than it is.
+
+**Claiming is exactly-once.** Two workers can never hold the same job at the same time — that's the `BEGIN IMMEDIATE` claim above, and it holds across separate OS processes. Under normal operation (including graceful shutdown, retries, and DLQ round-trips) every job's command runs exactly once.
+
+**Execution is at-least-once, and only a crash can make it more than once.** There is a window between the moment a command finishes and the moment the worker writes that outcome to the database. If the worker is `SIGKILL`ed inside that window, the command has already had its side effects, but nothing recorded them: the row is still `processing`, and the database has no way to distinguish "the command succeeded and the worker died before saying so" from "the command never ran at all". The reaper takes the only safe option and requeues it, so the command runs a second time.
+
+Closing that window for real needs the job's side effects and the queue's bookkeeping to commit together — a transactional outbox, or an idempotency key the command itself checks. Both push work onto the job author, and neither is in scope here. Every durable queue that runs arbitrary shell commands (SQS, Sidekiq, Celery) has the same seam in the same place.
+
+The practical consequence: **job commands should be idempotent** if a duplicate run would be harmful. `echo`, a rebuild, an `INSERT ... ON CONFLICT` are all fine. Charging a credit card is not.
+
 ## Configuration
 
 Everything here is stored in SQLite and changed with `queuectl config set <key> <value>` — nothing is hardcoded. `queuectl config get <key>` and `queuectl config list` read it back.
@@ -165,15 +225,16 @@ Everything here is stored in SQLite and changed with `queuectl config set <key> 
 | Key | Default | Must be | What it controls |
 | --- | ---: | --- | --- |
 | `max-retries` | `3` | `>= 1` | How many total attempts a new job gets before it's declared dead. |
-| `backoff-base` | `2` | `>= 1` | The base in `backoff_base ^ attempts` — how fast retry delays grow. |
+| `backoff-base` | `2` | `>= 1` | The base in `backoff_base ^ attempts` — how fast retry delays grow. The delay is capped at 1 hour, so a large base (or a job with a large `max_retries`) can't overflow the calculation into a nonsense delay. |
 | `poll-interval-ms` | `500` | `>= 50` | How long an idle worker sleeps between checks for new work. |
 | `lock-timeout-seconds` | `20` | `>= 1` | How long a `processing` job can go without a heartbeat before the reaper assumes its worker died. |
 | `worker-stale-seconds` | `15` | `>= 10` | How recent a worker's heartbeat needs to be for `status` to count it as active. The minimum is tied to the worker heartbeat cadence (every 5s): anything lower and a perfectly healthy worker would periodically show as inactive in the gap between two ordinary heartbeats. |
 | `stop-timeout-seconds` | `30` | `>= 1` | How long `worker stop` waits for a graceful shutdown before escalating to SIGKILL. |
+| `job-timeout-seconds` | `0` | `>= 0` | Default wall-clock limit for a job whose enqueue JSON has no `timeout_seconds`. `0` means no timeout. |
 
-Note that `max_retries` set in the enqueue JSON only affects that one job — it doesn't touch the `max-retries` config, and existing jobs don't retroactively pick up a config change either. Each job keeps whatever `max_retries` it was created with, since it's stored on the job row at enqueue time.
+Note that `max_retries` set in the enqueue JSON only affects that one job — it doesn't touch the `max-retries` config, and existing jobs don't retroactively pick up a config change either. Each job keeps whatever `max_retries` it was created with, since it's stored on the job row at enqueue time. `timeout_seconds` works exactly the same way: read from config at enqueue time if the JSON omits it, then baked into the job row.
 
-`backoff-base` behaves differently: it is *not* stored per job, so it's read fresh from config every time a retry delay is computed. Changing it with `config set backoff-base <n>` immediately changes the delay calculation for every job's *next* failure — including jobs that were already enqueued, already failed once and waiting on `next_retry_at`, or mid-execution when the change happens — not just jobs enqueued afterward. The same applies to `poll-interval-ms`, `lock-timeout-seconds`, `worker-stale-seconds`, and `stop-timeout-seconds`: all of them are read from config at the point of use rather than captured once, so `max-retries` (baked into the job row) is the one exception, not the rule.
+`backoff-base` behaves differently: it is *not* stored per job, so it's read fresh from config every time a retry delay is computed. Changing it with `config set backoff-base <n>` immediately changes the delay calculation for every job's *next* failure — including jobs that were already enqueued, already failed once and waiting on `next_retry_at`, or mid-execution when the change happens — not just jobs enqueued afterward. The same applies to `poll-interval-ms`, `lock-timeout-seconds`, `worker-stale-seconds`, and `stop-timeout-seconds`: all of them are read from config at the point of use rather than captured once. `max-retries` and `job-timeout-seconds` are the two exceptions, since both are baked into the job row at enqueue time.
 
 ## Testing
 
@@ -193,12 +254,15 @@ bash scripts/test.sh
 
 A few decisions worth calling out, in case they matter for how this gets evaluated:
 
+- **The queue is at-least-once, not exactly-once.** Claiming a job is exactly-once — two workers never hold the same row — but a worker `SIGKILL`ed in the window between its command finishing and the outcome being written will have the job requeued and run again, side effects and all. That's a property of crash recovery, not a bug, and it's why job commands should be idempotent. See [Delivery guarantee](#delivery-guarantee-at-least-once) for the full reasoning and what it would take to close.
 - **`max_retries` counts total attempts, not retries after the first failure.** So `max_retries: 3` means the job runs at most 3 times total, not 1 try + 3 retries. I went with this because it's what the field name in the assignment's job JSON implies, but it's worth flagging since "retries" is genuinely ambiguous.
 - **Commands run through `sh -c`**, not split and exec'd directly. This means pipes, quoting, redirects, and env vars all work like you'd expect from a shell — but it also means `queuectl` trusts whatever command it's given. There's no sandboxing here; don't point this at untrusted input.
 - Built and tested for **macOS/Linux**. No Windows support — `sh -c` doesn't exist there.
+- **A job that backgrounds a process (`something &`) completes as soon as the command itself exits.** The background process keeps running — that's what `&` means — but `queuectl` stops capturing its output after a few seconds and notes so in the job's stderr. Without that cutoff the worker would wait on the output pipe forever, since the backgrounded process inherits it and outlives the shell.
 - **Any number of worker supervisors can run against the same database at once**, including ones started from separate terminals — each registers its own PID file rather than contending for one. `worker stop` discovers and signals all of them. Multiple reapers ticking concurrently is safe (each stale-job recovery is fenced) but is redundant work; harmless at this scale.
 - Shutdown is two-tiered: **SIGTERM is graceful** (workers stop picking up new jobs and let whatever they're running finish), **SIGKILL is not** (it can cut a job off mid-execution). Either way, the job's command runs in its own OS process group, and the reaper kills that group (not just the DB row) once it notices the orphaned `processing` row on a later pass — so a forced shutdown doesn't leave the command running unsupervised in the background. That cleanup only happens once a `queuectl worker start` process is running its reaper again, so a job killed by `worker stop`'s SIGKILL escalation can stay orphaned until the next `worker start`, not instantly.
-- `lock-timeout-seconds` needs to comfortably exceed how long your jobs actually take to run — if a legitimate job runs past that window, the reaper can't tell it apart from a genuinely stuck one and will recover it out from under the worker still running it. Workers do renew their lease periodically while a command runs to push this out, but very long-running jobs would eventually want explicit timeout handling instead. The default (20s, with a reaper sweep every 10s) is tuned to keep worst-case crash recovery under the assignment's 60-second bound — see [DECISIONS.md](DECISIONS.md).
+- `lock-timeout-seconds` is *not* a job timeout, and the two are independent. It's how long a `processing` job can go without a lease renewal before the reaper assumes the **worker** died; workers renew their lease on a timer while a command runs, so a legitimately long job holds its lock indefinitely and is never reaped out from under itself. The default (20s, with a reaper sweep every 10s) is tuned to keep worst-case crash recovery under the assignment's 60-second bound — see [DECISIONS.md](DECISIONS.md). If you want to bound how long a **job** may run, that's `timeout_seconds` / `job-timeout-seconds`.
+- **A timeout is charged as a failed attempt; a dead worker is not.** A command that ran past its own deadline is the job failing, so it backs off, retries, and eventually lands in the DLQ like any other failure. A worker that got SIGKILLed says nothing about whether the command would have succeeded, so the reaper requeues that job with its retry budget untouched. Those are deliberately different, and it's the line that decides whether a poison job can exhaust its retries.
 - PID files: the default database uses `.queuectl/workers/`; anything opened with a custom `--db` gets its own hashed directory (`.queuectl/workers-<hash>/`) so two differently-named queues don't stomp on each other's PID files. Each running supervisor's own PID names its file within that directory.
 
 
