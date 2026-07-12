@@ -39,11 +39,11 @@ var validStates = map[State]struct{}{
 // and lock ownership (LockedBy/LockedAt/LockedPGID) used to fence
 // claim/complete/fail updates against concurrent workers and the reaper.
 type Job struct {
-	ID          string
-	Command     string
-	State       State
-	Attempts    int
-	MaxRetries  int
+	ID         string
+	Command    string
+	State      State
+	Attempts   int
+	MaxRetries int
 	// TimeoutSeconds bounds how long this job's command may run before the
 	// worker kills it. Zero means no timeout. A timed-out attempt is charged
 	// against the retry budget like any other failure: unlike a dead worker
