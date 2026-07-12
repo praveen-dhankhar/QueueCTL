@@ -4,7 +4,7 @@
 
 I built this as a backend internship assignment, so the scope is deliberately focused: a single-host queue you run from the terminal, not a distributed job system.
 
-Demo video: [watch here](https://drive.google.com/file/d/1A1UNLaXX3Np2dR4Gjmx-bNcFtxluOHnr/view?usp=sharing)
+Demo video: [watch here](https://drive.google.com/file/d/1awshL5vxTgYVtXDZ0W_F99IeD1xWiJfa/view?usp=sharing)
 
 See [DECISIONS.md](DECISIONS.md) for the specific design trade-offs (atomic claiming across processes, crash recovery timing, DLQ retry semantics, `worker stop` signaling, and what breaks if priorities were added).
 
@@ -272,18 +272,33 @@ done
 sleep 2
 ./queuectl status
 ```
+## Crash recovery (the SIGKILL test)
 
-Stop every supervisor (both Terminal 1's and Terminal 3's) with a single `worker stop`, then confirm a completed job survives the restart:
-
+**[T2]** Type:
+ 
 ```bash
-./queuectl worker stop
+./queuectl enqueue '{"id":"crash-job","command":"sleep 30 && echo survived","max_retries":3}'
+./queuectl status
+```
+**[T2]** Point at the still-running worker pane (T1), then hard-kill the supervisor
+from the driver pane with a SIGKILL — no graceful shutdown, no cleanup:
+ 
+```bash
+pkill -9 -f "queuectl worker start"
 ./queuectl status
 ```
 
-**Terminal 1** — start them back up:
-
+**[T1]** Restart workers:
+ 
 ```bash
 ./queuectl worker start --count 3
+```
+ 
+**[T2]** Wait, then:
+ 
+```bash
+./queuectl status
+./queuectl logs crash-job
 ```
 
 **Terminal 2**:
