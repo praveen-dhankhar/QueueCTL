@@ -29,6 +29,11 @@ const (
 // without actually needing a buggy command or store call to trigger one.
 var executeCommandFn = ExecuteCommand
 
+// registerWorkerFn is Store.RegisterWorker, indirected through a package-level
+// var so tests can fail a registration partway through Pool.Start's launch
+// loop - the one path where Start has to clean up workers it already started.
+var registerWorkerFn = (*storage.Store).RegisterWorker
+
 // Pool runs count worker goroutines against store, each independently
 // claiming and executing jobs, alongside heartbeat, lease-renewal, and
 // reaper background loops.
@@ -87,16 +92,30 @@ func (p *Pool) Start(ctx context.Context) error {
 		return fmt.Errorf("get hostname: %w", err)
 	}
 
+	// Workers run under a context this function can cancel on its own, not
+	// under ctx directly, so that a failure partway through the launch loop can
+	// stop the workers already running. Cancelling ctx still cancels this one.
+	workerCtx, stopWorkers := context.WithCancel(ctx)
+	defer stopWorkers()
+
 	var wg sync.WaitGroup
 	for i := 1; i <= p.count; i++ {
 		workerID := fmt.Sprintf("%s:%d:%d", hostname, os.Getpid(), i)
-		if err := p.store.RegisterWorker(context.Background(), workerID, os.Getpid(), hostname); err != nil {
+		if err := registerWorkerFn(p.store, context.Background(), workerID, os.Getpid(), hostname); err != nil {
+			// Returning here without cleaning up would leave every worker
+			// launched by an earlier iteration running: still claiming jobs,
+			// still executing them, still holding locks - outliving the Start
+			// call that owns them and answering to nobody. That is survivable
+			// today only because main exits immediately on this error, which
+			// makes it a bug waiting for the first caller that doesn't.
+			stopWorkers()
+			wg.Wait()
 			return err
 		}
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			p.runWorker(ctx, id)
+			p.runWorker(workerCtx, id)
 		}(workerID)
 	}
 
@@ -160,7 +179,30 @@ func (p *Pool) executeJob(workerID string, claimed job.Job) {
 	lease := newJobLease(claimed.LockedAt)
 	leaseCtx, stopLease := context.WithCancel(context.Background())
 	leaseDone := make(chan struct{})
-	go p.renewJobLease(leaseCtx, workerID, claimed.ID, lease, leaseDone)
+
+	// Losing the lock means the reaper has already requeued this job for
+	// someone else to run. The command this worker started must die, or the
+	// job's side effects happen twice: once here, once in whoever claims the
+	// requeued row. Canceling execCtx kills its process group (see
+	// ExecuteCommand). The reaper also kills the group via the persisted
+	// locked_pgid, but it can only do that if SetJobLockPGID actually landed -
+	// and that call is fenced on the very lock we just lost, so on this path it
+	// may well have failed. Killing from the worker side does not depend on it.
+	execCtx, cancelExec := context.WithCancel(context.Background())
+	defer cancelExec()
+
+	// A job's own timeout hangs off that same context, so expiry and lost-lock
+	// cancellation both reach the command through one cmd.Cancel - meaning a
+	// timeout kills the whole process group, not just the "sh" leader. Note
+	// this deliberately bounds the command, not executeJob as a whole: the
+	// store calls that record the outcome afterwards must still run.
+	if claimed.TimeoutSeconds > 0 {
+		var stopTimeout context.CancelFunc
+		execCtx, stopTimeout = context.WithTimeout(execCtx, time.Duration(claimed.TimeoutSeconds)*time.Second)
+		defer stopTimeout()
+	}
+
+	go p.renewJobLease(leaseCtx, workerID, claimed.ID, lease, leaseDone, cancelExec)
 	defer stopLease()
 
 	defer func() {
@@ -175,7 +217,21 @@ func (p *Pool) executeJob(workerID string, claimed job.Job) {
 			p.logRecordError("record job process group failed", workerID, claimed.ID, err)
 		}
 	}
-	result := executeCommandFn(context.Background(), claimed.Command, onStart)
+	result := executeCommandFn(execCtx, claimed.Command, onStart)
+
+	// A timed-out command was SIGKILLed, so it reports a non-zero (signaled)
+	// exit like any other failure and flows down the normal retry path below -
+	// charged an attempt, backed off, dead once out of retries. The exit code
+	// alone doesn't say why it died, though, so record the reason where
+	// "queuectl logs" will show it. The ExitCode check keeps a command that
+	// happened to finish successfully in the same instant the deadline expired
+	// from being labeled a timeout it didn't actually suffer.
+	if result.ExitCode != 0 && errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+		p.logger.Warn("job timed out; killed the command's process group",
+			"worker_id", workerID, "job_id", claimed.ID, "timeout_seconds", claimed.TimeoutSeconds)
+		result.Stderr = appendTimeoutNote(result.Stderr, claimed.TimeoutSeconds)
+	}
+
 	stopLease()
 	<-leaseDone
 	if lockedAt := lease.currentLockedAt(); lockedAt != nil {
@@ -216,6 +272,20 @@ func (p *Pool) executeJob(workerID string, claimed job.Job) {
 	}
 }
 
+// appendTimeoutNote records why a timed-out attempt died, on the end of
+// whatever output the command had managed to produce first. It is appended to
+// the already-rendered stderr text rather than written into the capped buffer
+// for the same reason ExecuteCommand appends its start-failure text there: a
+// command chatty enough to fill the buffer must not be able to truncate away
+// the explanation of its own death.
+func appendTimeoutNote(stderr string, timeoutSeconds int) string {
+	note := fmt.Sprintf("queuectl: attempt timed out after %ds and its process group was killed", timeoutSeconds)
+	if stderr == "" {
+		return note
+	}
+	return stderr + "\n" + note
+}
+
 func (p *Pool) logRecordError(message string, workerID string, jobID string, err error) {
 	if errors.Is(err, storage.ErrJobLockLost) {
 		p.logger.Warn(message, "worker_id", workerID, "job_id", jobID, "error", err)
@@ -224,7 +294,12 @@ func (p *Pool) logRecordError(message string, workerID string, jobID string, err
 	p.logger.Error(message, "worker_id", workerID, "job_id", jobID, "error", err)
 }
 
-func (p *Pool) renewJobLease(ctx context.Context, workerID string, jobID string, lease *jobLease, done chan<- struct{}) {
+// renewJobLease extends the job's lock until ctx is canceled. If the lock is
+// lost - the reaper reclaimed the job and requeued it for another worker - it
+// calls cancelExec to kill the command still running under this worker, since
+// that command's job now belongs to somebody else and letting it run to
+// completion would execute the job twice.
+func (p *Pool) renewJobLease(ctx context.Context, workerID string, jobID string, lease *jobLease, done chan<- struct{}, cancelExec context.CancelFunc) {
 	defer close(done)
 
 	ticker := time.NewTicker(p.lockRenewalInterval())
@@ -241,7 +316,9 @@ func (p *Pool) renewJobLease(ctx context.Context, workerID string, jobID string,
 				continue
 			}
 			if !ok {
-				p.logger.Warn("job lock lost during execution", "worker_id", workerID, "job_id", jobID)
+				p.logger.Warn("job lock lost during execution; killing the command so the requeued job is not run twice",
+					"worker_id", workerID, "job_id", jobID)
+				cancelExec()
 				return
 			}
 			lease.update(lockedAt)
