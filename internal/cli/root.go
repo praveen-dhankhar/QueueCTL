@@ -11,7 +11,7 @@ import (
 )
 
 // NewRootCommand builds the queuectl Cobra command tree: enqueue, worker
-// start/stop, status, list, dlq list/retry, and config set.
+// start/stop, status, list, dlq list/retry, config set, logs, and metrics.
 func NewRootCommand() *cobra.Command {
 	var dbPathFlag string
 
@@ -30,6 +30,7 @@ func NewRootCommand() *cobra.Command {
 	root.AddCommand(newDLQCommand(&dbPathFlag))
 	root.AddCommand(newConfigCommand(&dbPathFlag))
 	root.AddCommand(newLogsCommand(&dbPathFlag))
+	root.AddCommand(newMetricsCommand(&dbPathFlag))
 
 	return root
 }
