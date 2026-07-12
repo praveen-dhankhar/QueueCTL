@@ -80,17 +80,21 @@ func writePIDFileExclusive(pidPath string, pid int) error {
 // see isQueueCTLSupervisor for what "looks like queuectl" means and why
 // verification can fail outright in sandboxed environments.
 //
-// It returns an error only if there was nothing to stop at all: no PID
-// directory, no PID files in it, or every PID file present turned out to be
-// stale or unverifiable/non-queuectl. That mirrors the single-supervisor
-// version's behavior of failing when there's no running worker to stop,
-// while still succeeding as long as at least one real supervisor was
-// signaled.
+// Having nothing to stop - no PID directory, no PID files in it, or every
+// PID file present turning out to be stale or non-queuectl - is reported to
+// out but is not an error. "Stop the workers" is a request about a desired
+// end state, and that state already holds, so failing here would only punish
+// the callers most likely to hit it: teardown paths and scripts running under
+// "set -e", which stop workers that may already have exited on their own.
+// Stopping is idempotent for the same reason "systemctl stop" on an
+// already-stopped unit is. An error is still returned for a genuine failure,
+// e.g. a PID directory that exists but cannot be read.
 func StopAllSupervisors(pidDir string, timeout time.Duration, out io.Writer, force bool) error {
 	entries, err := os.ReadDir(pidDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("no worker supervisors running (pid directory %s does not exist)", pidDir)
+			_, printErr := fmt.Fprintf(out, "no worker supervisors running (pid directory %s does not exist); nothing to stop\n", pidDir)
+			return printErr
 		}
 		return fmt.Errorf("read worker pid directory %s: %w", pidDir, err)
 	}
@@ -143,10 +147,12 @@ func StopAllSupervisors(pidDir string, timeout time.Duration, out io.Writer, for
 	}
 
 	if !found {
-		return fmt.Errorf("no worker supervisors found in %s", pidDir)
+		_, printErr := fmt.Fprintf(out, "no worker supervisors found in %s; nothing to stop\n", pidDir)
+		return printErr
 	}
 	if len(signaled) == 0 {
-		return fmt.Errorf("no live queuectl worker supervisors found to stop in %s", pidDir)
+		_, printErr := fmt.Fprintf(out, "no live queuectl worker supervisors found to stop in %s\n", pidDir)
+		return printErr
 	}
 
 	deadline := time.Now().Add(timeout)

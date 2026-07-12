@@ -144,8 +144,26 @@ func (p *Pool) runWorker(ctx context.Context, workerID string) {
 		default:
 		}
 
-		claimed, ok, err := p.store.ClaimNextJob(context.Background(), workerID)
+		// The claim runs under ctx, not context.Background(). The select above
+		// only rules out a shutdown that had already been signaled before the
+		// claim began; a SIGTERM landing *during* the claim would otherwise
+		// still hand this worker a job - and the claim is not instant, since it
+		// can wait on the single connection and, across processes, on SQLite's
+		// write lock for up to busy_timeout. Running one more job after being
+		// told to stop is not what "finish the current job, then exit" means,
+		// and that job can outlive stop-timeout-seconds and get SIGKILLed for
+		// its trouble.
+		//
+		// Cancellation mid-claim is safe: withImmediateTx rolls back on any
+		// error, so a claim interrupted before COMMIT leaves the job pending for
+		// someone else rather than stranded in processing.
+		claimed, ok, err := p.store.ClaimNextJob(ctx, workerID)
 		if err != nil {
+			// A claim canceled by shutdown is the shutdown working, not a
+			// failure to report.
+			if ctx.Err() != nil {
+				return
+			}
 			p.logger.Error("claim job failed", "worker_id", workerID, "error", err)
 			p.sleep(ctx, claimErrorSleep)
 			continue

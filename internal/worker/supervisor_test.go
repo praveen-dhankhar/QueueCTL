@@ -83,18 +83,22 @@ func TestRegisterSupervisorReclaimsStaleFileForSamePID(t *testing.T) {
 	require.Equal(t, strconv.Itoa(os.Getpid()), string(raw))
 }
 
+// Having no supervisors to stop is a satisfied request, not a failure: a
+// teardown script running under "set -e" must not abort just because the
+// workers it is stopping had already exited. Each of the four "nothing to
+// stop" shapes below must therefore return nil and say so on out.
 func TestStopAllSupervisorsMissingDirectory(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "does-not-exist")
-	err := StopAllSupervisors(dir, time.Second, &bytes.Buffer{}, false)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "no worker supervisors")
+	var out bytes.Buffer
+	require.NoError(t, StopAllSupervisors(dir, time.Second, &out, false))
+	require.Contains(t, out.String(), "nothing to stop")
 }
 
 func TestStopAllSupervisorsEmptyDirectory(t *testing.T) {
 	dir := t.TempDir()
-	err := StopAllSupervisors(dir, time.Second, &bytes.Buffer{}, false)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "no worker supervisors found")
+	var out bytes.Buffer
+	require.NoError(t, StopAllSupervisors(dir, time.Second, &out, false))
+	require.Contains(t, out.String(), "no worker supervisors found")
 }
 
 func TestStopAllSupervisorsRemovesStalePIDFiles(t *testing.T) {
@@ -103,9 +107,9 @@ func TestStopAllSupervisorsRemovesStalePIDFiles(t *testing.T) {
 	path := filepath.Join(dir, strconv.Itoa(exitedPID)+".pid")
 	require.NoError(t, os.WriteFile(path, []byte(strconv.Itoa(exitedPID)), 0o644))
 
-	err := StopAllSupervisors(dir, time.Second, &bytes.Buffer{}, false)
-	require.Error(t, err, "a directory with only stale PID files has nothing live to stop")
-	require.Contains(t, err.Error(), "no live queuectl worker supervisors")
+	var out bytes.Buffer
+	require.NoError(t, StopAllSupervisors(dir, time.Second, &out, false))
+	require.Contains(t, out.String(), "no live queuectl worker supervisors")
 
 	_, statErr := os.Stat(path)
 	require.True(t, os.IsNotExist(statErr), "stale PID file should have been removed")
@@ -119,9 +123,9 @@ func TestStopAllSupervisorsSkipsLiveNonQueueCTLProcessEvenWithForce(t *testing.T
 	// A definitive "this is not queuectl" verdict must refuse to signal
 	// the process regardless of --force; force only relaxes the case
 	// where verification itself could not be performed.
-	err := StopAllSupervisors(dir, time.Second, &bytes.Buffer{}, true)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "no live queuectl worker supervisors")
+	var out bytes.Buffer
+	require.NoError(t, StopAllSupervisors(dir, time.Second, &out, true))
+	require.Contains(t, out.String(), "no live queuectl worker supervisors")
 
 	_, statErr := os.Stat(path)
 	require.NoError(t, statErr, "a live non-queuectl process's PID file must not be touched")
@@ -131,9 +135,9 @@ func TestStopAllSupervisorsIgnoresUnrelatedFilenames(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "README.txt"), []byte("not a pid file"), 0o644))
 
-	err := StopAllSupervisors(dir, time.Second, &bytes.Buffer{}, false)
-	require.Error(t, err, "a directory with only non-PID files has nothing to stop")
-	require.Contains(t, err.Error(), "no worker supervisors found")
+	var out bytes.Buffer
+	require.NoError(t, StopAllSupervisors(dir, time.Second, &out, false))
+	require.Contains(t, out.String(), "no worker supervisors found")
 }
 
 // spawnAndWaitExited starts and waits for a short-lived child process,

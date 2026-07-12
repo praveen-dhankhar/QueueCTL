@@ -91,6 +91,46 @@ func TestClaimRules(t *testing.T) {
 	require.Equal(t, "failed-past", claimed.ID)
 }
 
+// TestClaimUnderCanceledContextClaimsNothing pins the property Pool.runWorker's
+// graceful shutdown leans on: it passes the worker's shutdown context to
+// ClaimNextJob (rather than context.Background()) precisely so that a SIGTERM
+// landing mid-claim stops the worker instead of handing it one more job to run
+// after the stop signal. That only holds if a canceled context actually
+// prevents the claim.
+//
+// The second half is the half that would hurt if it broke: an interrupted claim
+// must leave the job pending for another worker, never half-claimed into
+// processing with a lock nobody holds - which would strand it until the reaper's
+// staleness timeout, turning an ordinary shutdown into a crash-recovery event.
+func TestClaimUnderCanceledContextClaimsNothing(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	pending, err := job.New("pending", "echo hello", 3, time.Now().UTC())
+	require.NoError(t, err)
+	require.NoError(t, store.InsertJob(ctx, pending))
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	_, ok, err := store.ClaimNextJob(canceled, "worker1")
+	require.Error(t, err)
+	require.False(t, ok)
+
+	jobs, err := store.ListJobs(ctx, job.StatePending)
+	require.NoError(t, err)
+	require.Len(t, jobs, 1, "an interrupted claim must leave the job pending, not stranded in processing")
+	require.Nil(t, jobs[0].LockedBy)
+
+	// The store is still usable afterwards: the rolled-back transaction must
+	// not have left the single pooled connection inside an open transaction.
+	claimed, ok, err := store.ClaimNextJob(ctx, "worker1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "pending", claimed.ID)
+}
+
 // TestClaimOrdersBySameSecondInsertionOrderNotID guards against a real
 // ordering gap: created_at has one-second resolution (sqliteTimeLayout has
 // no fractional seconds), so jobs enqueued within the same second tie on
