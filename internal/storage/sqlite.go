@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	appconfig "queuectl/internal/config"
@@ -16,6 +16,31 @@ import (
 )
 
 const sqliteTimeLayout = "2006-01-02 15:04:05"
+
+// jobColumns is the jobs column list, in the exact order scanJob reads them.
+// Every SELECT and RETURNING that produces a job.Job shares this one string
+// rather than repeating the list, so a new column can't be added to three of
+// the four call sites and silently shift the scan on the fourth.
+const jobColumns = `id, command, state, attempts, max_retries, timeout_seconds, next_retry_at, locked_by, locked_at, locked_pgid, created_at, updated_at`
+
+// sqliteRunTimeLayout is sqliteTimeLayout plus milliseconds, used only for
+// job_runs.started_at/finished_at. Those two columns are the only ones whose
+// *difference* is ever computed (GetMetrics derives avg/p95/max duration from
+// them), and at whole-second resolution a 200ms command records a duration of
+// either 0s or 1s depending on nothing but whether it happened to straddle a
+// second boundary - so every duration metric was noise for any job shorter
+// than a few seconds.
+//
+// The extra precision is deliberately not given to formatTime at large.
+// jobs.locked_at is fenced by exact string equality (see jobLockFence) against
+// values SQLite itself writes via CURRENT_TIMESTAMP, which has no fractional
+// part; widening the shared layout would make every fence compare a
+// millisecond-bearing string against a second-resolution one and silently
+// never match. Widening only job_runs is safe: julianday() parses the
+// fractional seconds, and the "finished_at > datetime('now', ...)" throughput
+// filters still compare correctly because the two forms share a prefix and
+// order lexicographically.
+const sqliteRunTimeLayout = "2006-01-02 15:04:05.000"
 
 // ErrJobLockLost is returned by RecordJobSuccess/RecordJobFailure when the
 // lock-fenced UPDATE affects zero rows, meaning another actor (typically
@@ -48,9 +73,9 @@ type JobRun struct {
 	FinishedAt time.Time
 }
 
-// Open creates the database file and parent directory if needed, applies
-// the production SQLite pragmas (WAL, busy_timeout, synchronous, foreign
-// keys), and runs migrations. The connection pool is capped at a single
+// Open creates the database file and parent directory if needed, applies the
+// production SQLite pragmas (WAL, busy_timeout, synchronous, foreign keys)
+// via the DSN, and runs migrations. The connection pool is capped at a single
 // connection (see the Store field docs) since modernc.org/sqlite is a
 // CGo-free driver and SQLite serializes writes regardless.
 func Open(ctx context.Context, path string) (*Store, error) {
@@ -58,7 +83,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, fmt.Errorf("create database directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", buildDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
@@ -66,10 +91,6 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	db.SetMaxIdleConns(1)
 
 	store := &Store{db: db, path: path}
-	if err := store.applyPragmas(ctx); err != nil {
-		db.Close()
-		return nil, err
-	}
 	if err := migrate(ctx, db); err != nil {
 		db.Close()
 		return nil, err
@@ -87,37 +108,60 @@ func (s *Store) Path() string {
 	return s.path
 }
 
-func (s *Store) applyPragmas(ctx context.Context) error {
-	pragmas := []string{
-		// busy_timeout must be set before journal_mode: converting a fresh
-		// database to WAL takes an exclusive lock, and without a busy
-		// timeout already in effect on this connection, a concurrent
-		// queuectl process opening the same new database file can fail
-		// with "database is locked" instead of retrying.
-		"PRAGMA busy_timeout = 5000;",
-		"PRAGMA journal_mode = WAL;",
-		"PRAGMA synchronous = NORMAL;",
-		"PRAGMA foreign_keys = ON;",
+// buildDSN renders path as a modernc.org/sqlite DSN carrying the production
+// pragmas, in the order they must be applied: busy_timeout first, because
+// converting a fresh database to WAL takes an exclusive lock, and without a
+// busy timeout already in effect a concurrent queuectl process opening the
+// same new database file fails with "database is locked" instead of retrying.
+//
+// The pragmas belong in the DSN rather than in "PRAGMA ..." statements run
+// after opening, because busy_timeout, synchronous, and foreign_keys are
+// per-connection state, not database state: a statement only configures the
+// one connection it happens to run on. That was survivable only by accident
+// here - SetMaxOpenConns(1) means there is normally just one connection - but
+// database/sql is free to discard a connection it considers bad and silently
+// open a replacement, and the replacement would come up with busy_timeout=0
+// and foreign_keys=OFF. busy_timeout=0 is precisely what turns concurrent
+// access from two queuectl processes into hard "database is locked" errors
+// instead of a short wait, i.e. it would break the cross-process guarantee
+// this queue is built on, intermittently and only under load. In the DSN, the
+// pragmas are applied by the driver to every connection it opens, including
+// replacements. (journal_mode=WAL is persistent database state and would
+// survive either way; it is included for completeness.)
+func buildDSN(path string) string {
+	params := url.Values{}
+	for _, pragma := range []string{
+		"busy_timeout(5000)",
+		"journal_mode(WAL)",
+		"synchronous(NORMAL)",
+		"foreign_keys(1)",
+	} {
+		params.Add("_pragma", pragma)
 	}
-	for _, pragma := range pragmas {
-		if _, err := s.db.ExecContext(ctx, pragma); err != nil {
-			return fmt.Errorf("apply %s: %w", strings.TrimSuffix(pragma, ";"), err)
-		}
+
+	// Escape the path: a database under a directory with a space in it (or
+	// any other URL-significant character) would otherwise produce a DSN the
+	// driver cannot parse.
+	dsn := url.URL{
+		Scheme:   "file",
+		Opaque:   (&url.URL{Path: path}).EscapedPath(),
+		RawQuery: params.Encode(),
 	}
-	return nil
+	return dsn.String()
 }
 
 // InsertJob persists a new job row. Callers should treat a "constraint"
 // error as a duplicate ID (jobs.id is the primary key).
 func (s *Store) InsertJob(ctx context.Context, j job.Job) error {
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO jobs(id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, locked_pgid, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+INSERT INTO jobs(`+jobColumns+`)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
 		j.ID,
 		j.Command,
 		string(j.State),
 		j.Attempts,
 		j.MaxRetries,
+		j.TimeoutSeconds,
 		nullableTime(j.NextRetryAt),
 		nullableString(j.LockedBy),
 		nullableTime(j.LockedAt),
@@ -134,7 +178,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
 // GetJob fetches a single job by ID.
 func (s *Store) GetJob(ctx context.Context, id string) (job.Job, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, locked_pgid, created_at, updated_at
+SELECT `+jobColumns+`
 FROM jobs WHERE id = ?;`, id)
 	return scanJob(row)
 }
@@ -145,7 +189,7 @@ FROM jobs WHERE id = ?;`, id)
 // when auto-generated and so aren't chronological themselves.
 func (s *Store) ListJobs(ctx context.Context, state job.State) ([]job.Job, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, locked_pgid, created_at, updated_at
+SELECT `+jobColumns+`
 FROM jobs
 WHERE state = ?
 ORDER BY created_at ASC, rowid ASC;`, string(state))
@@ -526,8 +570,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
 		nullableInt(run.ExitCode),
 		run.Stdout,
 		run.Stderr,
-		formatTime(run.StartedAt),
-		formatTime(run.FinishedAt),
+		formatRunTime(run.StartedAt),
+		formatRunTime(run.FinishedAt),
 	)
 	if err != nil {
 		return fmt.Errorf("insert job run: %w", err)
@@ -581,6 +625,7 @@ func scanJob(row scanner) (job.Job, error) {
 		&state,
 		&j.Attempts,
 		&j.MaxRetries,
+		&j.TimeoutSeconds,
 		&nextRetryAt,
 		&lockedBy,
 		&lockedAt,
@@ -653,15 +698,22 @@ func formatTime(t time.Time) string {
 	return t.UTC().Format(sqliteTimeLayout)
 }
 
+// formatRunTime renders a job_runs timestamp at millisecond resolution. See
+// sqliteRunTimeLayout for why only these columns get the extra precision.
+func formatRunTime(t time.Time) string {
+	return t.UTC().Format(sqliteRunTimeLayout)
+}
+
 func parseTime(raw string) (time.Time, error) {
 	layouts := []string{
+		sqliteRunTimeLayout,
 		sqliteTimeLayout,
 		time.RFC3339,
 		time.RFC3339Nano,
 	}
 	var lastErr error
 	for _, layout := range layouts {
-		if layout == sqliteTimeLayout {
+		if layout == sqliteTimeLayout || layout == sqliteRunTimeLayout {
 			t, err := time.ParseInLocation(layout, raw, time.UTC)
 			if err == nil {
 				return t.UTC(), nil

@@ -42,6 +42,7 @@ SET
 state = 'processing',
 locked_by = ?,
 locked_at = CURRENT_TIMESTAMP,
+locked_pgid = NULL,
 updated_at = CURRENT_TIMESTAMP
 WHERE id = (
 SELECT id
@@ -51,7 +52,7 @@ AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
 ORDER BY created_at ASC, rowid ASC
 LIMIT 1
 )
-RETURNING id, command, state, attempts, max_retries, next_retry_at, locked_by, locked_at, locked_pgid, created_at, updated_at;`, workerID)
+RETURNING `+jobColumns+`;`, workerID)
 
 		j, err := scanJob(row)
 		if errors.Is(err, sql.ErrNoRows) {

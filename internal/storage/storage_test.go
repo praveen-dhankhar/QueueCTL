@@ -183,13 +183,17 @@ func TestLockFencingPreventsStaleCompletion(t *testing.T) {
 
 	// Simulate the reaper recovering the job out from under worker1, e.g.
 	// because worker1's lease renewal stalled on a network blip.
-	recovered, err := store.RecoverStaleJob(ctx, claimed, claimed.Attempts+1, job.StateFailed, nil)
+	recovered, err := store.RecoverStaleJob(ctx, claimed, storage.JobRun{
+		WorkerID:   "worker1",
+		StartedAt:  now,
+		FinishedAt: now,
+	})
 	require.NoError(t, err)
 	require.True(t, recovered)
 
 	got, err := store.GetJob(ctx, claimed.ID)
 	require.NoError(t, err)
-	require.Equal(t, job.StateFailed, got.State)
+	require.Equal(t, job.StatePending, got.State)
 
 	// worker1 now finishes the command it was still executing and tries to
 	// record success against its stale lock. The fenced UPDATE must affect
@@ -207,7 +211,7 @@ func TestLockFencingPreventsStaleCompletion(t *testing.T) {
 
 	got, err = store.GetJob(ctx, claimed.ID)
 	require.NoError(t, err)
-	require.Equal(t, job.StateFailed, got.State, "reaper's recovery must survive the stale completion attempt")
+	require.Equal(t, job.StatePending, got.State, "reaper's recovery must survive the stale completion attempt")
 }
 
 func TestWorkerConcurrencyCompletesJobsOnce(t *testing.T) {
@@ -326,14 +330,19 @@ func TestReaperRecoversStaleProcessingJob(t *testing.T) {
 
 	got, err := store.GetJob(ctx, "stale")
 	require.NoError(t, err)
-	require.Equal(t, job.StateFailed, got.State)
-	require.Equal(t, 1, got.Attempts)
-	require.NotNil(t, got.NextRetryAt)
+	require.Equal(t, job.StatePending, got.State)
+	require.Equal(t, 0, got.Attempts, "the interrupted run was not the job's own failure")
+	require.Nil(t, got.NextRetryAt)
 	require.Nil(t, got.LockedBy)
 	require.Nil(t, got.LockedAt)
 }
 
-func TestReaperMovesFinalAttemptToDead(t *testing.T) {
+// A worker dying mid-run is not the job's failure, so the reaper must not
+// charge it an attempt: with max_retries = 1 (attempts already at its last
+// allowed value) the old behavior sent a perfectly healthy job straight to
+// dead on the first SIGKILL, instead of running it again. The job must come
+// back as pending, immediately claimable, with its attempts count untouched.
+func TestReaperRequeuesInterruptedJobWithoutChargingAnAttempt(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
 	defer store.Close()
@@ -342,10 +351,9 @@ func TestReaperMovesFinalAttemptToDead(t *testing.T) {
 	now := time.Now().UTC()
 	lockedBy := "worker1"
 	lockedAt := now.Add(-5 * time.Second)
-	stale, err := job.New("stale-dead", "false", 2, now.Add(-10*time.Second))
+	stale, err := job.New("stale-interrupted", "echo hi", 1, now.Add(-10*time.Second))
 	require.NoError(t, err)
 	stale.State = job.StateProcessing
-	stale.Attempts = 1
 	stale.LockedBy = &lockedBy
 	stale.LockedAt = &lockedAt
 	require.NoError(t, store.InsertJob(ctx, stale))
@@ -354,11 +362,26 @@ func TestReaperMovesFinalAttemptToDead(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, recovered)
 
-	got, err := store.GetJob(ctx, "stale-dead")
+	got, err := store.GetJob(ctx, "stale-interrupted")
 	require.NoError(t, err)
-	require.Equal(t, job.StateDead, got.State)
-	require.Equal(t, 2, got.Attempts)
-	require.Nil(t, got.NextRetryAt)
+	require.Equal(t, job.StatePending, got.State, "an interrupted job must be runnable again, not dead")
+	require.Equal(t, 0, got.Attempts, "a dead worker must not consume the job's retry budget")
+	require.Nil(t, got.NextRetryAt, "an interrupted job is not being punished, so it must be claimable at once")
+
+	// The interrupted attempt is still visible in "queuectl logs": a run row
+	// with no exit code, which is what marks it as interrupted rather than
+	// completed.
+	runs, err := store.ListJobRuns(ctx, "stale-interrupted")
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	require.Nil(t, runs[0].ExitCode)
+	require.Equal(t, "worker1", runs[0].WorkerID)
+
+	// And it can actually be claimed again, which is the whole point.
+	claimed, ok, err := store.ClaimNextJob(ctx, "worker2")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "stale-interrupted", claimed.ID)
 }
 
 func TestSetJobLockPGIDFencing(t *testing.T) {
