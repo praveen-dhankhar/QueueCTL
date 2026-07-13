@@ -163,7 +163,7 @@ Tune the defaults (see the [Configuration](#configuration) table below for what 
 ./queuectl config set max-retries 3
 ./queuectl config set backoff-base 2
 ./queuectl config set poll-interval-ms 500
-./queuectl config set lock-timeout-seconds 120
+./queuectl config set lock-timeout-seconds 20
 ./queuectl config set worker-stale-seconds 15
 ./queuectl config set stop-timeout-seconds 30
 ```
