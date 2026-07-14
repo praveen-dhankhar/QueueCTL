@@ -254,6 +254,61 @@ func TestLockFencingPreventsStaleCompletion(t *testing.T) {
 	require.Equal(t, job.StatePending, got.State, "reaper's recovery must survive the stale completion attempt")
 }
 
+// TestRepeatedInterruptionsSendJobToDLQ closes the crash-loop ceiling noted
+// on RecoverStaleJob: interrupted attempts deliberately don't consume the
+// retry budget, so before this cap a job whose command killed its own worker
+// every time (e.g. an OOM that takes the supervisor down) would be reclaimed
+// and re-run forever. After MaxJobInterrupts stale recoveries the job must
+// land in the DLQ instead of going back to pending.
+func TestRepeatedInterruptionsSendJobToDLQ(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	now := time.Now().UTC()
+	j, err := job.New("worker-killer", "echo boom", 3, now)
+	require.NoError(t, err)
+	require.NoError(t, store.InsertJob(ctx, j))
+
+	recoverOnce := func() {
+		t.Helper()
+		claimed, ok, err := store.ClaimNextJob(ctx, "worker1")
+		require.NoError(t, err)
+		require.True(t, ok)
+		recovered, err := store.RecoverStaleJob(ctx, claimed, storage.JobRun{
+			WorkerID:  "worker1",
+			StartedAt: now,
+		})
+		require.NoError(t, err)
+		require.True(t, recovered)
+	}
+
+	for i := 0; i < storage.MaxJobInterrupts-1; i++ {
+		recoverOnce()
+		got, err := store.GetJob(ctx, j.ID)
+		require.NoError(t, err)
+		require.Equal(t, job.StatePending, got.State,
+			"interruption %d of %d must not dead-letter the job yet", i+1, storage.MaxJobInterrupts)
+	}
+
+	recoverOnce()
+	got, err := store.GetJob(ctx, j.ID)
+	require.NoError(t, err)
+	require.Equal(t, job.StateDead, got.State,
+		"interruption %d must send the job to the DLQ", storage.MaxJobInterrupts)
+
+	// A deliberate DLQ retry is a human vouching for the job again, so the
+	// interruption budget must reset along with attempts: the retried job
+	// gets the full cap before dead-lettering again, not an instant death on
+	// its next unlucky worker crash.
+	require.NoError(t, store.RetryDeadJob(ctx, j.ID))
+	recoverOnce()
+	got, err = store.GetJob(ctx, j.ID)
+	require.NoError(t, err)
+	require.Equal(t, job.StatePending, got.State,
+		"RetryDeadJob must reset the interruption count")
+}
+
 func TestWorkerConcurrencyCompletesJobsOnce(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()

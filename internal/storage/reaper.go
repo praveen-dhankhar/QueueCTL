@@ -27,6 +27,18 @@ ORDER BY locked_at ASC;`, lockTimeoutSeconds)
 	return scanJobs(rows)
 }
 
+// MaxJobInterrupts caps how many times a job may be recovered from a stale
+// processing lock before it is dead-lettered instead of requeued. Interrupted
+// attempts deliberately don't consume the job's retry budget (see
+// RecoverStaleJob), which left one unbounded loop: a job whose command kills
+// its own worker every run (an OOM big enough to take the supervisor with it,
+// say) would be reclaimed and re-run forever. Five worker deaths in a row on
+// the same job is no longer bad operational luck - it is evidence the job
+// itself is the killer, and the DLQ is where it can be inspected without
+// taking more workers down. A deliberate "queuectl dlq retry" resets the
+// count (see RetryDeadJob).
+const MaxJobInterrupts = 5
+
 // errRecoveryFenceLost is an internal sentinel used to roll back
 // RecoverStaleJob's transaction when the lock fence doesn't match, so the
 // job_runs row it would have written for the interrupted attempt is not
@@ -53,12 +65,11 @@ var errRecoveryFenceLost = errors.New("recovery fence lost")
 // isn't being punished for a failure, so it becomes claimable immediately
 // rather than after a backoff.
 //
-// ponytail: an interrupted attempt is now completely uncounted, so a job
-// whose command somehow kills its own worker every time (an OOM big enough
-// to take the supervisor with it, say) would be retried forever. Bounding
-// that needs a separate counter - an `interrupts` column with its own cap -
-// rather than overloading `attempts`, which is the field that means "times
-// this command actually ran and failed".
+// Interruptions are still bounded, just by their own budget: each recovery
+// increments the jobs.interrupts column (a separate counter, not `attempts`,
+// which keeps meaning "times this command actually ran and failed"), and a
+// job reaching MaxJobInterrupts goes to dead instead of pending. The CASE in
+// the UPDATE makes the count-and-decide atomic with the recovery itself.
 func (s *Store) RecoverStaleJob(ctx context.Context, j job.Job, run JobRun) (bool, error) {
 	run.JobID = j.ID
 	run.Attempt = j.Attempts + 1
@@ -70,8 +81,11 @@ func (s *Store) RecoverStaleJob(ctx context.Context, j job.Job, run JobRun) (boo
 	err = s.withImmediateTx(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		result, err := conn.ExecContext(ctx, `
 UPDATE jobs
-SET state = 'pending', next_retry_at = NULL, locked_by = NULL, locked_at = NULL, locked_pgid = NULL, updated_at = ?
+SET state = CASE WHEN interrupts + 1 >= ? THEN 'dead' ELSE 'pending' END,
+interrupts = interrupts + 1,
+next_retry_at = NULL, locked_by = NULL, locked_at = NULL, locked_pgid = NULL, updated_at = ?
 WHERE id = ? AND state = 'processing' AND locked_by = ? AND locked_at = ?;`,
+			MaxJobInterrupts,
 			formatTime(time.Now()),
 			j.ID,
 			lockedBy,
@@ -98,9 +112,9 @@ WHERE id = ? AND state = 'processing' AND locked_by = ? AND locked_at = ?;`,
 	return true, nil
 }
 
-// RetryDeadJob moves a dead job back to pending with attempts and locks
-// reset, fenced on state = 'dead' so retrying a job that isn't currently
-// dead returns an error instead of silently reviving it.
+// RetryDeadJob moves a dead job back to pending with attempts, interrupts
+// and locks reset, fenced on state = 'dead' so retrying a job that isn't
+// currently dead returns an error instead of silently reviving it.
 //
 // locked_pgid is cleared along with the rest of the lock. It is always already
 // NULL on a dead job today (the only path into dead, RecordJobFailure, nulls
@@ -113,6 +127,7 @@ func (s *Store) RetryDeadJob(ctx context.Context, id string) error {
 UPDATE jobs
 SET state = 'pending',
 attempts = 0,
+interrupts = 0,
 next_retry_at = NULL,
 locked_by = NULL,
 locked_at = NULL,

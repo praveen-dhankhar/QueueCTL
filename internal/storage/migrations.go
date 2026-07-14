@@ -54,6 +54,7 @@ id TEXT PRIMARY KEY,
 command TEXT NOT NULL,
 state TEXT NOT NULL CHECK (state IN ('pending', 'processing', 'completed', 'failed', 'dead')),
 attempts INTEGER NOT NULL DEFAULT 0,
+interrupts INTEGER NOT NULL DEFAULT 0,
 max_retries INTEGER NOT NULL,
 timeout_seconds INTEGER NOT NULL DEFAULT 0,
 next_retry_at DATETIME,
@@ -107,6 +108,9 @@ FOREIGN KEY (job_id) REFERENCES jobs(id)
 		return err
 	}
 	if err := ensureColumn(ctx, conn, "jobs", "timeout_seconds", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(ctx, conn, "jobs", "interrupts", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 

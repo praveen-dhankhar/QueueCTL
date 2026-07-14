@@ -49,7 +49,9 @@ const interruptedRunNote = "queuectl: attempt interrupted - the worker holding t
 //
 // A recovered job keeps its attempts count: a dead worker is not a failed
 // command, so the interrupted attempt is recorded in job_runs but not
-// charged against the job's retry budget. See storage.RecoverStaleJob.
+// charged against the job's retry budget. Interruptions have their own
+// budget instead - a job recovered storage.MaxJobInterrupts times is
+// dead-lettered rather than requeued. See storage.RecoverStaleJob.
 func RunReaperOnce(ctx context.Context, store *storage.Store, logger *slog.Logger) (int, error) {
 	lockTimeout, err := store.GetConfigInt(ctx, appconfig.KeyLockTimeoutSeconds)
 	if err != nil {
